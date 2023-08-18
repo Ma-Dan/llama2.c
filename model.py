@@ -260,7 +260,7 @@ class Transformer(nn.Module):
             self.last_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
             # inference-time mini-optimization: only forward the output on the very last position
-            logits = self.output(h[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            logits = self.output(h[:, :, :]) # note: using list [-1] to preserve the time dim
             self.last_loss = None
 
         return logits
@@ -315,12 +315,12 @@ class Transformer(nn.Module):
         Most likely you'll want to make sure to be in model.eval() mode of operation for this.
         Also note this is a super inefficient version of sampling with no key/value cache.
         """
-        for _ in range(max_new_tokens):
+        for i in range(max_new_tokens-1):
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.params.max_seq_len else idx[:, -self.params.max_seq_len:]
             # forward the model to get the logits for the index in the sequence
             logits = self(idx_cond)
-            logits = logits[:, -1, :] # crop to just the final time step
+            logits = logits[:, i, :] # crop to just the final time step
             if temperature == 0.0:
                 # "sample" the single most likely index
                 _, idx_next = torch.topk(logits, k=1, dim=-1)
@@ -335,9 +335,10 @@ class Transformer(nn.Module):
                 probs = F.softmax(logits, dim=-1)
                 idx_next = torch.multinomial(probs, num_samples=1)
             # append sampled index to the running sequence and continue
-            idx = torch.cat((idx, idx_next), dim=1)
+            #idx = torch.cat((idx, idx_next), dim=1)
+            idx[0][i+1] = idx_next
 
-        return idx
+        return idx[:i+1]
 
     def export(self, filepath='model.bin'):
         """export the model weights in fp32 into .bin file to be read from C"""
