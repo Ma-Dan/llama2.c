@@ -83,17 +83,13 @@ typedef struct {
 
 // CUDA functions
 // Global resource
-cudaStream_t stream;
 cublasHandle_t handle;
 
 void createResource() {
-    cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
     cublasCreate(&handle);
-    cublasSetStream(handle, stream);
 }
 
 void destroyResource() {
-    cudaStreamDestroy(stream);
     cublasDestroy(handle);
 }
 
@@ -134,7 +130,7 @@ void matmul(float* xout, float* x, float* w, int n, int d, Config* p) {
     }
 
     // copy host memory to device
-    cudaMemcpyAsync(d_B, x, mem_size_B, cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(d_B, x, mem_size_B, cudaMemcpyHostToDevice);
 
     // Calculate with Cublas
     const float alpha = 1.0f;
@@ -150,8 +146,7 @@ void matmul(float* xout, float* x, float* w, int n, int d, Config* p) {
         dimsA.x, &beta, d_C, dimsB.x);*/
 
     // Copy result from device to host
-    cudaMemcpyAsync(xout, d_C, mem_size_C, cudaMemcpyDeviceToHost, stream);
-    cudaStreamSynchronize(stream);
+    cudaMemcpyAsync(xout, d_C, mem_size_C, cudaMemcpyDeviceToHost);
 }
 
 void malloc_operands(Config* p)
@@ -359,7 +354,7 @@ void softmax(float* x, int size) {
     }
 }
 
-/*void matmul(float* xout, float* x, float* w, int n, int d) {
+void matmul_cpu(float* xout, float* x, float* w, int n, int d) {
     // W (d,n) @ x (n,) -> xout (d,)
     // by far the most amount of time is spent inside this little function
     int i;
@@ -371,7 +366,7 @@ void softmax(float* x, int size) {
         }
         xout[i] = val;
     }
-}*/
+}
 
 float* forward(Transformer* transformer, int token, int pos) {
 
