@@ -70,6 +70,19 @@ testcc:
 	$(CC) -DVERBOSITY=$(VERBOSITY) -O3 -o testc test.c -lm
 	./testc
 
+CUDA_PATH ?= /usr/local/cuda
+HOST_COMPILER = g++
+NVCC          := $(CUDA_PATH)/bin/nvcc -ccbin $(HOST_COMPILER)
+NVCCFLAGS = -m64 -O3 -gencode arch=compute_50,code=sm_50 -gencode arch=compute_52,code=sm_52 -gencode arch=compute_60,code=sm_60 -gencode arch=compute_61,code=sm_61 -gencode arch=compute_70,code=sm_70 -gencode arch=compute_75,code=sm_75 -gencode arch=compute_80,code=sm_80 -gencode arch=compute_86,code=sm_86 -gencode arch=compute_86,code=compute_86
+
+.PHONY: qwen
+qwen: qwen.cu
+	$(NVCC) $(NVCCFLAGS) $(subst -Ofast,-O3,$(CXXFLAGS)) -lcublas -lculibos -lcudart -lcublasLt -L/usr/local/cuda/lib64 -L/opt/cuda/lib64 -L$(CUDA_PATH)/targets/x86_64-linux/lib $< -o $@
+
+.PHONY: qwen_float
+qwen_float: qwen_float.cu
+	$(NVCC) $(NVCCFLAGS) $(subst -Ofast,-O3,$(CXXFLAGS)) -lcublas -lculibos -lcudart -lcublasLt -L/usr/local/cuda/lib64 -L/opt/cuda/lib64 -L$(CUDA_PATH)/targets/x86_64-linux/lib $< -o $@
+
 .PHONY: clean
 clean:
 	rm -f run

@@ -1,0 +1,44 @@
+{
+    // 使用 IntelliSense 了解相关属性。
+    // 悬停以查看现有属性的描述。
+    // 欲了解更多信息，请访问: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "qwen",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/qwen",
+            "args": ["./qwen_chat_0_5b.bin", "0.8", "2048", ""],
+            "environment": [{"name": "LD_LIBRARY_PATH", "value": ""}],
+            "cwd": "${workspaceFolder}",
+            "stopAtEntry": false,
+            "externalConsole": false,
+            "MIMode": "gdb",
+            "miDebuggerPath": "/usr/bin/gdb"
+        },
+        {
+            "name": "qwen_float",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/qwen_float",
+            "args": ["./qwen_chat_0_5b.bin", "0.8", "2048", ""],
+            "environment": [{"name": "LD_LIBRARY_PATH", "value": ""}],
+            "cwd": "${workspaceFolder}",
+            "stopAtEntry": false,
+            "externalConsole": false,
+            "MIMode": "gdb",
+            "miDebuggerPath": "/usr/bin/gdb"
+        },
+        {
+            "name": "export qwen",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "export.py",
+            "args": ["--hf", "/root/autodl-tmp/Qwen1.5-1.8B-Chat", "./qwen_chat_1_8b.bin"],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "env": {}
+        },
+    ]
+}
