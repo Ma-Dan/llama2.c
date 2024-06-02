@@ -31,6 +31,23 @@
             "miDebuggerPath": "/usr/bin/gdb"
         },
         {
+            "name": "qwen_chat",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/qwen_chat",
+            "args": ["qwen_chat_0_5b.bin", "", "0.85"],
+            "environment": [{"name": "OMP_NUM_THREADS", "value": "4"}],
+            "cwd": "${workspaceFolder}",
+            "stopAtEntry": false,
+            "externalConsole": false,
+            "MIMode": "gdb",
+            "miDebuggerPath": "/usr/bin/gdb",
+            "setupCommands": [
+                { "text": "-enable-pretty-printing", "description": "enable pretty printing", "ignoreFailures": true },
+                { "text": "handle SIGPIPE nostop noprint pass", "description": "ignore SIGPIPE", "ignoreFailures": true }
+            ]
+        },
+        {
             "name": "export qwen",
             "type": "debugpy",
             "request": "launch",
