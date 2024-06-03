@@ -376,12 +376,10 @@ int divUp(int a, int b) {
     return (a - 1) / b + 1;
 }
 
-int uploadWeight(void *w, int elements, FILE* f, void *scratchCpu, void *scratchGpu) {
-    int count = fread(scratchCpu, sizeof(float), elements, f);
+int uploadWeight(void *w, int elements, FILE* f, void *scratchCpu) {
+    int count = fread(scratchCpu, sizeof(half), elements, f);
     if (count != elements) return 1;
-    // copy and convert fp32->fp16
-    cudaMemcpyAsync(scratchGpu, scratchCpu, sizeof(float) * elements, cudaMemcpyHostToDevice);
-    convert_fp32_to_fp16 <<<divUp(elements, 256), 256 >>> ((half*)w, (float*)scratchGpu, elements);
+    cudaMemcpyAsync(w, scratchCpu, sizeof(half) * elements, cudaMemcpyHostToDevice);
     return 0;
 }
 
@@ -391,30 +389,27 @@ int uploadWeight(void *w, int elements, FILE* f, void *scratchCpu, void *scratch
 int checkpoint_init_weights(TransformerWeights* w, Config* p, FILE* f, int shared_weights) {
     size_t scratch_size = p->n_layers * std::max(p->dim, p->hidden_dim) * p->dim;
     scratch_size = std::max((size_t)p->vocab_size * p->dim, scratch_size);
-    scratch_size *= sizeof(float);
+    scratch_size *= sizeof(half);
     void* scratchCpu = malloc(scratch_size);
-    void* scratchGpu = nullptr;
-    cudaMalloc(&scratchGpu, scratch_size);
-    if (uploadWeight(w->token_embedding_table, p->vocab_size * p->dim, f, scratchCpu, scratchGpu)) return 1;
-    if (uploadWeight(w->rms_att_weight, p->n_layers * p->dim, f, scratchCpu, scratchGpu)) return 1;
-    if (uploadWeight(w->wq, p->n_layers * (p->dim * p->dim + p->dim), f, scratchCpu, scratchGpu)) return 1;
-    if (uploadWeight(w->wk, p->n_layers * (p->dim * p->dim + p->dim), f, scratchCpu, scratchGpu)) return 1;
-    if (uploadWeight(w->wv, p->n_layers * (p->dim * p->dim + p->dim), f, scratchCpu, scratchGpu)) return 1;
-    if (uploadWeight(w->wo, p->n_layers * p->dim * p->dim, f, scratchCpu, scratchGpu)) return 1;
-    if (uploadWeight(w->rms_ffn_weight, p->n_layers * p->dim, f, scratchCpu, scratchGpu)) return 1;
-    if (uploadWeight(w->w1, p->n_layers * p->dim * p->hidden_dim, f, scratchCpu, scratchGpu)) return 1;
-    if (uploadWeight(w->w2, p->n_layers * p->hidden_dim * p->dim, f, scratchCpu, scratchGpu)) return 1;
-    if (uploadWeight(w->w3, p->n_layers * p->dim * p->hidden_dim, f, scratchCpu, scratchGpu)) return 1;
-    if (uploadWeight(w->rms_final_weight, p->dim, f, scratchCpu, scratchGpu)) return 1;
+    if (uploadWeight(w->token_embedding_table, p->vocab_size * p->dim, f, scratchCpu)) return 1;
+    if (uploadWeight(w->rms_att_weight, p->n_layers * p->dim, f, scratchCpu)) return 1;
+    if (uploadWeight(w->wq, p->n_layers * (p->dim * p->dim + p->dim), f, scratchCpu)) return 1;
+    if (uploadWeight(w->wk, p->n_layers * (p->dim * p->dim + p->dim), f, scratchCpu)) return 1;
+    if (uploadWeight(w->wv, p->n_layers * (p->dim * p->dim + p->dim), f, scratchCpu)) return 1;
+    if (uploadWeight(w->wo, p->n_layers * p->dim * p->dim, f, scratchCpu)) return 1;
+    if (uploadWeight(w->rms_ffn_weight, p->n_layers * p->dim, f, scratchCpu)) return 1;
+    if (uploadWeight(w->w1, p->n_layers * p->dim * p->hidden_dim, f, scratchCpu)) return 1;
+    if (uploadWeight(w->w2, p->n_layers * p->hidden_dim * p->dim, f, scratchCpu)) return 1;
+    if (uploadWeight(w->w3, p->n_layers * p->dim * p->hidden_dim, f, scratchCpu)) return 1;
+    if (uploadWeight(w->rms_final_weight, p->dim, f, scratchCpu)) return 1;
 
     int head_size = p->dim / p->n_heads;
-    if (uploadWeight(w->freq_cis_real, p->seq_len * head_size / 2, f, scratchCpu, scratchGpu)) return 1;
-    if (uploadWeight(w->freq_cis_imag, p->seq_len * head_size / 2, f, scratchCpu, scratchGpu)) return 1;
+    if (uploadWeight(w->freq_cis_real, p->seq_len * head_size / 2, f, scratchCpu)) return 1;
+    if (uploadWeight(w->freq_cis_imag, p->seq_len * head_size / 2, f, scratchCpu)) return 1;
 
     if (!shared_weights)
-        if (uploadWeight(w->wcls, p->vocab_size * p->dim, f, scratchCpu, scratchGpu)) return 1;
+        if (uploadWeight(w->wcls, p->vocab_size * p->dim, f, scratchCpu)) return 1;
 
-    cudaFree(scratchGpu);
     free(scratchCpu);
     return 0;
 }
