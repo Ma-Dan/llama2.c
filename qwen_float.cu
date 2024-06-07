@@ -113,22 +113,17 @@ __global__ void mat_bias_vec_kernel(float* output, float* input, float* weight, 
 }
 
 // Each block processes a single head
-__global__ void RoPERotation_kernel(float* sq, float* sk, float* f_real, float* f_imag, int num_heads, int head_size) {
+__global__ void RoPERotation_kernel(float* sqk, float* f_real, float* f_imag, int num_heads, int head_size) {
     int h = blockIdx.x;
-    float* q = sq + h * head_size;
-    float* k = sk + h * head_size;
+    float* qk = sqk + h * head_size;
 
     int i = threadIdx.x;
-    float q0 = q[i];
-    float q1 = q[i + head_size/2];
-    float k0 = k[i];
-    float k1 = k[i + head_size/2];
+    float qk0 = qk[i];
+    float qk1 = qk[i + head_size/2];
     float fcr = f_real[i];
     float fci = f_imag[i];
-    q[i] = q0 * fcr - q1 * fci;
-    q[i + head_size/2] = q0 * fci + q1 * fcr;
-    k[i] = k0 * fcr - k1 * fci;
-    k[i + head_size/2] = k0 * fci + k1 * fcr;
+    qk[i] = qk0 * fcr - qk1 * fci;
+    qk[i + head_size/2] = qk0 * fci + qk1 * fcr;
 }
 
 __device__ void softmax_gpu(float* __restrict__ x, int size) {
@@ -175,7 +170,7 @@ __device__ void softmax_gpu(float* __restrict__ x, int size) {
 #define MAX_SEQ_LEN 8192
 __global__ void MultiHeadAttention_kernel(float* __restrict__ output, const float* __restrict__ sq,
     const float* __restrict__ key_cache, const float* __restrict__ value_cache,
-    int num_heads, int head_size, int loff, int seq_len, int dim) {
+    int num_heads, int num_groups, int head_size, int kv_size, int loff, int seq_len, int dim) {
     int h = blockIdx.x;
 
     // get the query vector for this head
@@ -186,7 +181,7 @@ __global__ void MultiHeadAttention_kernel(float* __restrict__ output, const floa
     // iterate over all timesteps, including the current one
     for (int t = threadIdx.x; t < seq_len; t += blockDim.x) {
         // get the key vector for this head and at this timestep
-        const float* k = key_cache + loff + t * dim + h * head_size;
+        const float* k = key_cache + loff + t * kv_size + (h / num_groups) * head_size;
         // calculate the attention score as the dot product of q and k
         float score = 0.0f;
         for (int i = 0; i < head_size; i++)
@@ -205,7 +200,7 @@ __global__ void MultiHeadAttention_kernel(float* __restrict__ output, const floa
     for (int i = threadIdx.x; i < head_size; i += blockDim.x) {
         float val = 0.0f;
         for (int t = 0; t < seq_len; t++)
-            val += att[t] * (float)value_cache[loff + t * dim + h * head_size + i];
+            val += att[t] * (float)value_cache[loff + t * kv_size + (h / num_groups) * head_size + i];
         output[h * head_size + i] = val;
     }
 }
@@ -229,6 +224,7 @@ typedef struct {
     int n_layers; // number of layers
     int n_heads; // number of query heads
     int n_kv_heads; // number of key/value heads (can be < query heads because of multiquery)
+    int n_gqa_groups; // number of GQA share group
     int vocab_size; // vocabulary size, usually 256 (byte-level)
     int seq_len; // max sequence length
 } Config;
@@ -276,6 +272,7 @@ typedef struct {
 } RunState;
 
 void malloc_run_state(RunState* s, Config* p) {
+    int kv_size = p->dim / p->n_gqa_groups;
     cudaMalloc((void**)&s->x, p->dim * sizeof(float));
     cudaMalloc((void**)&s->xb, p->dim * sizeof(float));
     cudaMalloc((void**)&s->xb2, p->dim * sizeof(float));
@@ -285,8 +282,8 @@ void malloc_run_state(RunState* s, Config* p) {
     cudaMalloc((void**)&s->k, p->dim * sizeof(float));
     cudaMalloc((void**)&s->v, p->dim * sizeof(float));
     cudaMalloc((void**)&s->logits_gpu, p->vocab_size * sizeof(float));
-    cudaMalloc((void**)&s->key_cache, p->n_layers * p->seq_len * p->dim * sizeof(float));    // potentially huge allocs
-    cudaMalloc((void**)&s->value_cache, p->n_layers * p->seq_len * p->dim * sizeof(float));
+    cudaMalloc((void**)&s->key_cache, p->n_layers * p->seq_len * kv_size * sizeof(float));    // potentially huge allocs
+    cudaMalloc((void**)&s->value_cache, p->n_layers * p->seq_len * kv_size * sizeof(float));
     cudaMalloc((void**)&s->logits_temp, p->vocab_size * sizeof(float));
     s->logits = (float*)malloc(p->vocab_size * sizeof(float));
 
@@ -316,12 +313,13 @@ void free_run_state(RunState* s) {
 }
 
 void malloc_weights(TransformerWeights* w, Config* p, int shared_weights) {
+    int kv_size = p->dim / p->n_gqa_groups;
     cudaMalloc((void**)&w->token_embedding_table, p->vocab_size * p->dim * sizeof(float));
     cudaMalloc((void**)&w->rms_att_weight, p->n_layers * p->dim * sizeof(float));
     cudaMalloc((void**)&w->rms_ffn_weight, p->n_layers * p->dim * sizeof(float));
     cudaMalloc((void**)&w->wq, p->n_layers * (p->dim * p->dim + p->dim) * sizeof(float));
-    cudaMalloc((void**)&w->wk, p->n_layers * (p->dim * p->dim + p->dim) * sizeof(float));
-    cudaMalloc((void**)&w->wv, p->n_layers * (p->dim * p->dim + p->dim) * sizeof(float));
+    cudaMalloc((void**)&w->wk, p->n_layers * (p->dim * kv_size + kv_size) * sizeof(float));
+    cudaMalloc((void**)&w->wv, p->n_layers * (p->dim * kv_size + kv_size) * sizeof(float));
     cudaMalloc((void**)&w->wo, p->n_layers * p->dim * p->dim * sizeof(float));
     cudaMalloc((void**)&w->w1, p->n_layers * p->hidden_dim * p->dim * sizeof(float));
     cudaMalloc((void**)&w->w2, p->n_layers * p->dim * p->hidden_dim * sizeof(float));
@@ -367,10 +365,9 @@ int divUp(int a, int b) {
     return (a - 1) / b + 1;
 }
 
-int uploadWeight(void *w, int elements, FILE* f, void *scratchCpu, void *scratchGpu) {
+int uploadWeight(void *w, int elements, FILE* f, void *scratchCpu) {
     int count = fread(scratchCpu, sizeof(float), elements, f);
     if (count != elements) return 1;
-    // copy and convert fp32->fp16
     cudaMemcpyAsync(w, scratchCpu, sizeof(float) * elements, cudaMemcpyHostToDevice);
     return 0;
 }
@@ -379,32 +376,30 @@ int uploadWeight(void *w, int elements, FILE* f, void *scratchCpu, void *scratch
 // initialization: read from checkpoint
 
 int checkpoint_init_weights(TransformerWeights* w, Config* p, FILE* f, int shared_weights) {
+    int kv_size = p->dim / p->n_gqa_groups;
     size_t scratch_size = p->n_layers * std::max(p->dim, p->hidden_dim) * p->dim;
     scratch_size = std::max((size_t)p->vocab_size * p->dim, scratch_size);
     scratch_size *= sizeof(float);
     void* scratchCpu = malloc(scratch_size);
-    void* scratchGpu = nullptr;
-    cudaMalloc(&scratchGpu, scratch_size);
-    if (uploadWeight(w->token_embedding_table, p->vocab_size * p->dim, f, scratchCpu, scratchGpu)) return 1;
-    if (uploadWeight(w->rms_att_weight, p->n_layers * p->dim, f, scratchCpu, scratchGpu)) return 1;
-    if (uploadWeight(w->wq, p->n_layers * (p->dim * p->dim + p->dim), f, scratchCpu, scratchGpu)) return 1;
-    if (uploadWeight(w->wk, p->n_layers * (p->dim * p->dim + p->dim), f, scratchCpu, scratchGpu)) return 1;
-    if (uploadWeight(w->wv, p->n_layers * (p->dim * p->dim + p->dim), f, scratchCpu, scratchGpu)) return 1;
-    if (uploadWeight(w->wo, p->n_layers * p->dim * p->dim, f, scratchCpu, scratchGpu)) return 1;
-    if (uploadWeight(w->rms_ffn_weight, p->n_layers * p->dim, f, scratchCpu, scratchGpu)) return 1;
-    if (uploadWeight(w->w1, p->n_layers * p->dim * p->hidden_dim, f, scratchCpu, scratchGpu)) return 1;
-    if (uploadWeight(w->w2, p->n_layers * p->hidden_dim * p->dim, f, scratchCpu, scratchGpu)) return 1;
-    if (uploadWeight(w->w3, p->n_layers * p->dim * p->hidden_dim, f, scratchCpu, scratchGpu)) return 1;
-    if (uploadWeight(w->rms_final_weight, p->dim, f, scratchCpu, scratchGpu)) return 1;
+    if (uploadWeight(w->token_embedding_table, p->vocab_size * p->dim, f, scratchCpu)) return 1;
+    if (uploadWeight(w->rms_att_weight, p->n_layers * p->dim, f, scratchCpu)) return 1;
+    if (uploadWeight(w->wq, p->n_layers * (p->dim * p->dim + p->dim), f, scratchCpu)) return 1;
+    if (uploadWeight(w->wk, p->n_layers * (p->dim * kv_size + kv_size), f, scratchCpu)) return 1;
+    if (uploadWeight(w->wv, p->n_layers * (p->dim * kv_size + kv_size), f, scratchCpu)) return 1;
+    if (uploadWeight(w->wo, p->n_layers * p->dim * p->dim, f, scratchCpu)) return 1;
+    if (uploadWeight(w->rms_ffn_weight, p->n_layers * p->dim, f, scratchCpu)) return 1;
+    if (uploadWeight(w->w1, p->n_layers * p->dim * p->hidden_dim, f, scratchCpu)) return 1;
+    if (uploadWeight(w->w2, p->n_layers * p->hidden_dim * p->dim, f, scratchCpu)) return 1;
+    if (uploadWeight(w->w3, p->n_layers * p->dim * p->hidden_dim, f, scratchCpu)) return 1;
+    if (uploadWeight(w->rms_final_weight, p->dim, f, scratchCpu)) return 1;
 
     int head_size = p->dim / p->n_heads;
-    if (uploadWeight(w->freq_cis_real, p->seq_len * head_size / 2, f, scratchCpu, scratchGpu)) return 1;
-    if (uploadWeight(w->freq_cis_imag, p->seq_len * head_size / 2, f, scratchCpu, scratchGpu)) return 1;
+    if (uploadWeight(w->freq_cis_real, p->seq_len * head_size / 2, f, scratchCpu)) return 1;
+    if (uploadWeight(w->freq_cis_imag, p->seq_len * head_size / 2, f, scratchCpu)) return 1;
 
     if (!shared_weights)
-        if (uploadWeight(w->wcls, p->vocab_size * p->dim, f, scratchCpu, scratchGpu)) return 1;
+        if (uploadWeight(w->wcls, p->vocab_size * p->dim, f, scratchCpu)) return 1;
 
-    cudaFree(scratchGpu);
     free(scratchCpu);
     return 0;
 }
@@ -486,13 +481,13 @@ void matmul_bias(float* xout, float* x, float* w, float* b, int n, int d) {
 #endif
 }
 
-void RoPERotation(float *q, float *k, float *f_real, float *f_imag, int num_heads, int head_size) {
-    RoPERotation_kernel <<<num_heads, head_size / 2 >>> (q, k, f_real, f_imag, num_heads, head_size);
+void RoPERotation(float *qk, float *f_real, float *f_imag, int num_heads, int head_size) {
+    RoPERotation_kernel <<<num_heads, head_size / 2 >>> (qk, f_real, f_imag, num_heads, head_size);
 }
 
-void MultiHeadAttention(float *output, float *q, float *key_cache, float *value_cache, int num_heads, int head_size, int loff, int seq_len) {
+void MultiHeadAttention(float *output, float *q, float *key_cache, float *value_cache, int num_heads, int num_groups, int head_size, int kv_size, int loff, int seq_len) {
     int dim = head_size * num_heads;
-    MultiHeadAttention_kernel <<<num_heads, 1024>>> (output, q, key_cache, value_cache, num_heads, head_size, loff, seq_len, dim);
+    MultiHeadAttention_kernel <<<num_heads, 1024>>> (output, q, key_cache, value_cache, num_heads, num_groups, head_size, kv_size, loff, seq_len, dim);
 }
 
 void siluElementwiseMul(float *hb, float *hb2, int size) {
@@ -506,6 +501,7 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
     int dim = p->dim;
     int hidden_dim = p->hidden_dim;
     int head_size = dim / p->n_heads;
+    int kv_size = dim / p->n_gqa_groups;
 
     // copy the token embedding into x
     float* content_row = &(w->token_embedding_table[token * dim]);
@@ -526,26 +522,27 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
         //cudaMemcpyAsync(debug.data(), w->wq + l * (dim * dim + dim) + dim * dim, dim * sizeof(float), cudaMemcpyDeviceToHost);
 
         // qkv matmuls for this position
-        cudaMemcpyAsync(debug.data(), s->xb, dim * sizeof(float), cudaMemcpyDeviceToHost);
-        cudaMemcpyAsync(debug.data(), w->wq + l * (dim * dim + dim), dim * dim * sizeof(float), cudaMemcpyDeviceToHost);
+        //cudaMemcpyAsync(debug.data(), s->xb, dim * sizeof(float), cudaMemcpyDeviceToHost);
+        //cudaMemcpyAsync(debug.data(), w->wq + l * (dim * dim + dim), dim * dim * sizeof(float), cudaMemcpyDeviceToHost);
         matmul_bias(s->q, s->xb, w->wq + l * (dim * dim + dim), w->wq + l * (dim * dim + dim) + dim * dim, dim, dim);
-        cudaMemcpyAsync(debug.data(), s->q, dim * sizeof(float), cudaMemcpyDeviceToHost);
-        matmul_bias(s->k, s->xb, w->wk + l * (dim * dim + dim), w->wk + l * (dim * dim + dim) + dim * dim, dim, dim);
-        matmul_bias(s->v, s->xb, w->wv + l * (dim * dim + dim), w->wv + l * (dim * dim + dim) + dim * dim, dim, dim);
+        //cudaMemcpyAsync(debug.data(), s->q, dim * sizeof(float), cudaMemcpyDeviceToHost);
+        matmul_bias(s->k, s->xb, w->wk + l * (dim * kv_size + kv_size), w->wk + l * (dim * kv_size + kv_size) + dim * kv_size, dim, kv_size);
+        matmul_bias(s->v, s->xb, w->wv + l * (dim * kv_size + kv_size), w->wv + l * (dim * kv_size + kv_size) + dim * kv_size, dim, kv_size);
 
         // apply RoPE rotation to the q and k vectors for each head
         cudaMemcpyAsync(debug.data(), s->q, dim * sizeof(float), cudaMemcpyDeviceToHost);
-        RoPERotation(s->q, s->k, freq_cis_real_row, freq_cis_imag_row, p->n_heads, head_size);
-        cudaMemcpyAsync(debug.data(), s->q, dim * sizeof(float), cudaMemcpyDeviceToHost);
+        RoPERotation(s->q, freq_cis_real_row, freq_cis_imag_row, p->n_heads, head_size);
+        RoPERotation(s->k, freq_cis_real_row, freq_cis_imag_row, kv_size/head_size, head_size);
+        //cudaMemcpyAsync(debug.data(), s->q, dim * sizeof(float), cudaMemcpyDeviceToHost);
 
         // save key,value at this time step (pos) to our kv cache
-        int loff = l * p->seq_len * dim; // kv cache layer offset for convenience
-        float* key_cache_row = s->key_cache + loff + pos * dim;
-        float* value_cache_row = s->value_cache + loff + pos * dim;
-        cudaMemcpyAsync(key_cache_row, s->k, dim * sizeof(float), cudaMemcpyDeviceToDevice);
-        cudaMemcpyAsync(value_cache_row, s->v, dim * sizeof(float), cudaMemcpyDeviceToDevice);
+        int loff = l * p->seq_len * kv_size; // kv cache layer offset for convenience
+        float* key_cache_row = s->key_cache + loff + pos * kv_size;
+        float* value_cache_row = s->value_cache + loff + pos * kv_size;
+        cudaMemcpyAsync(key_cache_row, s->k, kv_size * sizeof(float), cudaMemcpyDeviceToDevice);
+        cudaMemcpyAsync(value_cache_row, s->v, kv_size * sizeof(float), cudaMemcpyDeviceToDevice);
 
-        MultiHeadAttention(s->xb, s->q, s->key_cache, s->value_cache, p->n_heads, head_size, loff, pos+1);
+        MultiHeadAttention(s->xb, s->q, s->key_cache, s->value_cache, p->n_heads, p->n_gqa_groups, head_size, kv_size, loff, pos+1);
 
         // final matmul to get the output of the attention
         matmul(s->xb2, s->xb, w->wo + l * dim * dim, dim, dim);
