@@ -179,7 +179,7 @@ __device__ void softmax_gpu(float* __restrict__ x, int size) {
 #define MAX_SEQ_LEN 8192
 __global__ void MultiHeadAttention_kernel(half* __restrict__ output, const half* __restrict__ sq,
     const half* __restrict__ key_cache, const half* __restrict__ value_cache,
-    int num_heads, int head_size, int kv_size, int loff, int seq_len, int dim) {
+    int num_heads, int num_groups, int head_size, int kv_size, int loff, int seq_len, int dim) {
     int h = blockIdx.x;
 
     // get the query vector for this head
@@ -190,7 +190,7 @@ __global__ void MultiHeadAttention_kernel(half* __restrict__ output, const half*
     // iterate over all timesteps, including the current one
     for (int t = threadIdx.x; t < seq_len; t += blockDim.x) {
         // get the key vector for this head and at this timestep
-        const half* k = key_cache + loff + t * kv_size + (h / 7) * head_size;
+        const half* k = key_cache + loff + t * kv_size + (h / num_groups) * head_size;
         // calculate the attention score as the dot product of q and k
         float score = 0.0f;
         for (int i = 0; i < head_size; i++)
@@ -209,7 +209,7 @@ __global__ void MultiHeadAttention_kernel(half* __restrict__ output, const half*
     for (int i = threadIdx.x; i < head_size; i += blockDim.x) {
         float val = 0.0f;
         for (int t = 0; t < seq_len; t++)
-            val += att[t] * (float)value_cache[loff + t * kv_size + (h / 7) * head_size + i];
+            val += att[t] * (float)value_cache[loff + t * kv_size + (h / num_groups) * head_size + i];
         output[h * head_size + i] = (half)val;
     }
 }
@@ -233,9 +233,9 @@ typedef struct {
     int n_layers; // number of layers
     int n_heads; // number of query heads
     int n_kv_heads; // number of key/value heads (can be < query heads because of multiquery)
+    int n_gqa_groups; // number of GQA share group
     int vocab_size; // vocabulary size, usually 256 (byte-level)
     int seq_len; // max sequence length
-    int kv_size;
 } Config;
 
 typedef struct {
@@ -321,12 +321,13 @@ void free_run_state(RunState* s) {
 }
 
 void malloc_weights(TransformerWeights* w, Config* p, int shared_weights) {
+    int kv_size = p->dim / p->n_gqa_groups;
     cudaMalloc((void**)&w->token_embedding_table, p->vocab_size * p->dim * sizeof(half));
     cudaMalloc((void**)&w->rms_att_weight, p->n_layers * p->dim * sizeof(half));
     cudaMalloc((void**)&w->rms_ffn_weight, p->n_layers * p->dim * sizeof(half));
     cudaMalloc((void**)&w->wq, p->n_layers * (p->dim * p->dim + p->dim) * sizeof(half));
-    cudaMalloc((void**)&w->wk, p->n_layers * (p->dim * p->kv_size + p->kv_size) * sizeof(half));
-    cudaMalloc((void**)&w->wv, p->n_layers * (p->dim * p->kv_size + p->kv_size) * sizeof(half));
+    cudaMalloc((void**)&w->wk, p->n_layers * (p->dim * kv_size + kv_size) * sizeof(half));
+    cudaMalloc((void**)&w->wv, p->n_layers * (p->dim * kv_size + kv_size) * sizeof(half));
     cudaMalloc((void**)&w->wo, p->n_layers * p->dim * p->dim * sizeof(half));
     cudaMalloc((void**)&w->w1, p->n_layers * p->hidden_dim * p->dim * sizeof(half));
     cudaMalloc((void**)&w->w2, p->n_layers * p->dim * p->hidden_dim * sizeof(half));
@@ -383,6 +384,7 @@ int uploadWeight(void *w, int elements, FILE* f, void *scratchCpu) {
 // initialization: read from checkpoint
 
 int checkpoint_init_weights(TransformerWeights* w, Config* p, FILE* f, int shared_weights) {
+    int kv_size = p->dim / p->n_gqa_groups;
     size_t scratch_size = p->n_layers * std::max(p->dim, p->hidden_dim) * p->dim;
     scratch_size = std::max((size_t)p->vocab_size * p->dim, scratch_size);
     scratch_size *= sizeof(half);
@@ -390,8 +392,8 @@ int checkpoint_init_weights(TransformerWeights* w, Config* p, FILE* f, int share
     if (uploadWeight(w->token_embedding_table, p->vocab_size * p->dim, f, scratchCpu)) return 1;
     if (uploadWeight(w->rms_att_weight, p->n_layers * p->dim, f, scratchCpu)) return 1;
     if (uploadWeight(w->wq, p->n_layers * (p->dim * p->dim + p->dim), f, scratchCpu)) return 1;
-    if (uploadWeight(w->wk, p->n_layers * (p->dim * p->kv_size + p->kv_size), f, scratchCpu)) return 1;
-    if (uploadWeight(w->wv, p->n_layers * (p->dim * p->kv_size + p->kv_size), f, scratchCpu)) return 1;
+    if (uploadWeight(w->wk, p->n_layers * (p->dim * kv_size + kv_size), f, scratchCpu)) return 1;
+    if (uploadWeight(w->wv, p->n_layers * (p->dim * kv_size + kv_size), f, scratchCpu)) return 1;
     if (uploadWeight(w->wo, p->n_layers * p->dim * p->dim, f, scratchCpu)) return 1;
     if (uploadWeight(w->rms_ffn_weight, p->n_layers * p->dim, f, scratchCpu)) return 1;
     if (uploadWeight(w->w1, p->n_layers * p->dim * p->hidden_dim, f, scratchCpu)) return 1;
@@ -491,9 +493,9 @@ void RoPERotation(half *qk, half *f_real, half *f_imag, int num_heads, int head_
     RoPERotation_kernel <<<num_heads, head_size / 2 >>> (qk, f_real, f_imag, num_heads, head_size);
 }
 
-void MultiHeadAttention(half *output, half *q, half *key_cache, half *value_cache, int num_heads, int head_size, int kv_size, int loff, int seq_len) {
+void MultiHeadAttention(half *output, half *q, half *key_cache, half *value_cache, int num_heads, int num_groups, int head_size, int kv_size, int loff, int seq_len) {
     int dim = head_size * num_heads;
-    MultiHeadAttention_kernel <<<num_heads, 1024>>> (output, q, key_cache, value_cache, num_heads, head_size, kv_size, loff, seq_len, dim);
+    MultiHeadAttention_kernel <<<num_heads, 1024>>> (output, q, key_cache, value_cache, num_heads, num_groups, head_size, kv_size, loff, seq_len, dim);
 }
 
 void siluElementwiseMul(half *hb, half *hb2, int size) {
@@ -507,7 +509,7 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
     int dim = p->dim;
     int hidden_dim = p->hidden_dim;
     int head_size = dim / p->n_heads;
-    int kv_size = p->kv_size;
+    int kv_size = dim / p->n_gqa_groups;
 
     // copy the token embedding into x
     half* content_row = &(w->token_embedding_table[token * dim]);
@@ -530,7 +532,7 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
 
         // apply RoPE rotation to the q and k vectors for each head
         RoPERotation(s->q, freq_cis_real_row, freq_cis_imag_row, p->n_heads, head_size);
-        RoPERotation(s->k, freq_cis_real_row, freq_cis_imag_row, 2, head_size);
+        RoPERotation(s->k, freq_cis_real_row, freq_cis_imag_row, kv_size/head_size, head_size);
 
         // save key,value at this time step (pos) to our kv cache
         int loff = l * p->seq_len * kv_size; // kv cache layer offset for convenience
@@ -539,7 +541,7 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
         cudaMemcpyAsync(key_cache_row, s->k, kv_size * sizeof(half), cudaMemcpyDeviceToDevice);
         cudaMemcpyAsync(value_cache_row, s->v, kv_size * sizeof(half), cudaMemcpyDeviceToDevice);
 
-        MultiHeadAttention(s->xb, s->q, s->key_cache, s->value_cache, p->n_heads, head_size, kv_size, loff, pos+1);
+        MultiHeadAttention(s->xb, s->q, s->key_cache, s->value_cache, p->n_heads, p->n_gqa_groups, head_size, kv_size, loff, pos+1);
 
         // final matmul to get the output of the attention
         matmul(s->xb2, s->xb, w->wo + l * dim * dim, dim, dim);

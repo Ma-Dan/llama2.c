@@ -84,8 +84,9 @@ def legacy_export(model, filepath):
     if not shared_classifier:
         p.vocab_size = -p.vocab_size
     n_kv_heads = p.n_heads if p.n_kv_heads is None else p.n_kv_heads
+    n_gqa_groups = p.dim // model.layers[0].attention.wk.weight.shape[0]
     header = struct.pack('iiiiiiii', p.dim, hidden_dim, p.n_layers, p.n_heads,
-                                    n_kv_heads, p.vocab_size, p.max_seq_len, 128)
+                                    n_kv_heads, n_gqa_groups, p.vocab_size, p.max_seq_len)
     out_file.write(header)
 
     # next write out the embedding weights
