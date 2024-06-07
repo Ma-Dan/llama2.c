@@ -221,7 +221,7 @@ int main(int argc, char** argv) {
 
       // feed forward
       for (; pos < seq_len; pos++) {
-        run_transformer(tokens[pos], pos+1, logits.data(), transformer);
+        run_transformer(tokens[pos], pos, logits.data(), transformer);
         out_count++;
 
         if (pos < prompt_end - 1) continue;

@@ -15,7 +15,7 @@ Inference for Llama-2 Transformer model in pure Cuda.
 #include <cublas_v2.h>
 #include <vector>
 
-std::vector<float> debug(1024*1024, 0);
+std::vector<float> debug(1536*1536, 0);
 
 cublasHandle_t handle;
 
@@ -135,7 +135,7 @@ __device__ void softmax_gpu(float* __restrict__ x, int size) {
     int step = blockDim.x;
 
     // find max value (for numerical stability)
-    float max_val = tid < size ? x[tid] : 0;
+    float max_val = tid < size ? x[tid] : -1e6;
     for (int i = tid + step; i < size; i += step)
         if (x[i] > max_val)
             max_val = x[i];
@@ -168,7 +168,7 @@ __device__ void softmax_gpu(float* __restrict__ x, int size) {
 // Poor parallelism and even poorer memory access pattern.
 // Ankan - TODO: optimize this.
 #define MAX_SEQ_LEN 8192
-__global__ void MultiHeadAttention_kernel(float* __restrict__ output, const float* __restrict__ sq,
+__global__ void MultiHeadAttention_kernel(float* __restrict__ output, float* __restrict__ debug, const float* __restrict__ sq,
     const float* __restrict__ key_cache, const float* __restrict__ value_cache,
     int num_heads, int num_groups, int head_size, int kv_size, int loff, int seq_len, int dim) {
     int h = blockIdx.x;
@@ -192,9 +192,17 @@ __global__ void MultiHeadAttention_kernel(float* __restrict__ output, const floa
     }
     __syncthreads();
 
+    for (int t = threadIdx.x; t < seq_len; t += blockDim.x) {
+        debug[t] = att[t];
+    }
+
     // softmax the scores to get attention weights
     softmax_gpu(att, seq_len);
     __syncthreads();
+
+    /*for (int t = threadIdx.x; t < seq_len; t += blockDim.x) {
+        debug[t] = att[t];
+    }*/
 
     // weighted sum of the values, store back into xb
     for (int i = threadIdx.x; i < head_size; i += blockDim.x) {
@@ -269,6 +277,7 @@ typedef struct {
     // kv cache
     float* key_cache;   // (layer, seq_len, dim)
     float* value_cache; // (layer, seq_len, dim)
+    float* debug;
 } RunState;
 
 void malloc_run_state(RunState* s, Config* p) {
@@ -285,6 +294,7 @@ void malloc_run_state(RunState* s, Config* p) {
     cudaMalloc((void**)&s->key_cache, p->n_layers * p->seq_len * kv_size * sizeof(float));    // potentially huge allocs
     cudaMalloc((void**)&s->value_cache, p->n_layers * p->seq_len * kv_size * sizeof(float));
     cudaMalloc((void**)&s->logits_temp, p->vocab_size * sizeof(float));
+    cudaMalloc((void**)&s->debug, 1536*1536*(sizeof(float)));
     s->logits = (float*)malloc(p->vocab_size * sizeof(float));
 
     // ensure all mallocs went fine
@@ -485,9 +495,9 @@ void RoPERotation(float *qk, float *f_real, float *f_imag, int num_heads, int he
     RoPERotation_kernel <<<num_heads, head_size / 2 >>> (qk, f_real, f_imag, num_heads, head_size);
 }
 
-void MultiHeadAttention(float *output, float *q, float *key_cache, float *value_cache, int num_heads, int num_groups, int head_size, int kv_size, int loff, int seq_len) {
+void MultiHeadAttention(float *output, float* debug, float *q, float *key_cache, float *value_cache, int num_heads, int num_groups, int head_size, int kv_size, int loff, int seq_len) {
     int dim = head_size * num_heads;
-    MultiHeadAttention_kernel <<<num_heads, 1024>>> (output, q, key_cache, value_cache, num_heads, num_groups, head_size, kv_size, loff, seq_len, dim);
+    MultiHeadAttention_kernel <<<num_heads, 1024>>> (output, debug, q, key_cache, value_cache, num_heads, num_groups, head_size, kv_size, loff, seq_len, dim);
 }
 
 void siluElementwiseMul(float *hb, float *hb2, int size) {
@@ -518,6 +528,8 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
 
         // attention rmsnorm
         rmsnorm(s->xb, x, w->rms_att_weight + l * dim, dim);
+        //cudaMemcpyAsync(debug.data(), s->xb, dim * sizeof(float), cudaMemcpyDeviceToHost);
+        //cudaMemcpyAsync(debug.data(), w->rms_att_weight + l * dim, dim * sizeof(float), cudaMemcpyDeviceToHost);
 
         //cudaMemcpyAsync(debug.data(), w->wq + l * (dim * dim + dim) + dim * dim, dim * sizeof(float), cudaMemcpyDeviceToHost);
 
@@ -530,10 +542,12 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
         matmul_bias(s->v, s->xb, w->wv + l * (dim * kv_size + kv_size), w->wv + l * (dim * kv_size + kv_size) + dim * kv_size, dim, kv_size);
 
         // apply RoPE rotation to the q and k vectors for each head
-        cudaMemcpyAsync(debug.data(), s->q, dim * sizeof(float), cudaMemcpyDeviceToHost);
+        //cudaMemcpyAsync(debug.data(), s->q, dim * sizeof(float), cudaMemcpyDeviceToHost);
+        //cudaMemcpyAsync(debug.data(), s->k, dim * sizeof(float), cudaMemcpyDeviceToHost);
         RoPERotation(s->q, freq_cis_real_row, freq_cis_imag_row, p->n_heads, head_size);
         RoPERotation(s->k, freq_cis_real_row, freq_cis_imag_row, kv_size/head_size, head_size);
         //cudaMemcpyAsync(debug.data(), s->q, dim * sizeof(float), cudaMemcpyDeviceToHost);
+        //cudaMemcpyAsync(debug.data(), s->k, dim * sizeof(float), cudaMemcpyDeviceToHost);
 
         // save key,value at this time step (pos) to our kv cache
         int loff = l * p->seq_len * kv_size; // kv cache layer offset for convenience
@@ -542,30 +556,46 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
         cudaMemcpyAsync(key_cache_row, s->k, kv_size * sizeof(float), cudaMemcpyDeviceToDevice);
         cudaMemcpyAsync(value_cache_row, s->v, kv_size * sizeof(float), cudaMemcpyDeviceToDevice);
 
-        MultiHeadAttention(s->xb, s->q, s->key_cache, s->value_cache, p->n_heads, p->n_gqa_groups, head_size, kv_size, loff, pos+1);
+        MultiHeadAttention(s->xb, s->debug, s->q, s->key_cache, s->value_cache, p->n_heads, p->n_gqa_groups, head_size, kv_size, loff, pos+1);
+        cudaMemcpyAsync(debug.data(), s->debug, dim * sizeof(float), cudaMemcpyDeviceToHost);
+        cudaMemcpyAsync(debug.data(), s->xb, dim * sizeof(float), cudaMemcpyDeviceToHost);
 
         // final matmul to get the output of the attention
         matmul(s->xb2, s->xb, w->wo + l * dim * dim, dim, dim);
 
+        cudaMemcpyAsync(debug.data(), s->xb2, dim * sizeof(float), cudaMemcpyDeviceToHost);
+
         // residual connection back into x
         accum(x, s->xb2, dim);
 
+        cudaMemcpyAsync(debug.data(), x, dim * sizeof(float), cudaMemcpyDeviceToHost);
+
         // ffn rmsnorm
         rmsnorm(s->xb, x, w->rms_ffn_weight + l * dim, dim);
+
+        cudaMemcpyAsync(debug.data(), s->xb, dim * sizeof(float), cudaMemcpyDeviceToHost);
 
         // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
         // first calculate self.w1(x) and self.w3(x)
         matmul(s->hb, s->xb, w->w1 + l * dim * hidden_dim, dim, hidden_dim);
         matmul(s->hb2, s->xb, w->w3 + l * dim * hidden_dim, dim, hidden_dim);
 
+        cudaMemcpyAsync(debug.data(), s->hb2, dim * sizeof(float), cudaMemcpyDeviceToHost);
+
         // apply F.silu activation on hb and multiply it with hb2
         siluElementwiseMul(s->hb, s->hb2, hidden_dim);
+
+        cudaMemcpyAsync(debug.data(), s->hb, dim * sizeof(float), cudaMemcpyDeviceToHost);
 
         // final matmul to get the output of the ffn
         matmul(s->xb, s->hb, w->w2 + l * dim * hidden_dim, hidden_dim, dim);
 
+        cudaMemcpyAsync(debug.data(), s->xb, dim * sizeof(float), cudaMemcpyDeviceToHost);
+
         // residual connection
         accum(x, s->xb, dim);
+
+        cudaMemcpyAsync(debug.data(), x, dim * sizeof(float), cudaMemcpyDeviceToHost);
     }
 
     // final rmsnorm
@@ -842,15 +872,15 @@ int main(int argc, char *argv[]) {
     long start = 0;  // used to time our code, only initialized after first iteration
     int next;        // will store the next token in the sequence
     int token = prompt_tokens[0];
-    int pos = 1;     // position in the sequence
+    int pos = 0;     // position in the sequence
     while (pos < steps) {
 
         // forward the transformer to get logits for the next token
         transformer(token, pos, &config, &state, &weights);
 
-        if(pos < num_prompt_tokens) {
+        if(pos < num_prompt_tokens-1) {
             // if we are still processing the input prompt, force the next prompt token
-            next = prompt_tokens[pos];
+            next = prompt_tokens[pos+1];
         } else {
             // sample the next token
             if (temperature == 0.0f) {

@@ -144,7 +144,7 @@ __device__ void softmax_gpu(float* __restrict__ x, int size) {
     int step = blockDim.x;
 
     // find max value (for numerical stability)
-    float max_val = tid < size ? x[tid] : 0;
+    float max_val = tid < size ? x[tid] : -1e6;
     for (int i = tid + step; i < size; i += step)
         if (x[i] > max_val)
             max_val = x[i];
@@ -281,6 +281,7 @@ typedef struct {
 } RunState;
 
 void malloc_run_state(RunState* s, Config* p) {
+    int kv_size = p->dim / p->n_gqa_groups;
     cudaMalloc((void**)&s->x, p->dim * sizeof(half));
     cudaMalloc((void**)&s->xb, p->dim * sizeof(half));
     cudaMalloc((void**)&s->xb2, p->dim * sizeof(half));
@@ -290,8 +291,8 @@ void malloc_run_state(RunState* s, Config* p) {
     cudaMalloc((void**)&s->k, p->dim * sizeof(half));
     cudaMalloc((void**)&s->v, p->dim * sizeof(half));
     cudaMalloc((void**)&s->logits_gpu, p->vocab_size * sizeof(half));
-    cudaMalloc((void**)&s->key_cache, p->n_layers * p->seq_len * p->dim * sizeof(half));    // potentially huge allocs
-    cudaMalloc((void**)&s->value_cache, p->n_layers * p->seq_len * p->dim * sizeof(half));
+    cudaMalloc((void**)&s->key_cache, p->n_layers * p->seq_len * kv_size * sizeof(half));    // potentially huge allocs
+    cudaMalloc((void**)&s->value_cache, p->n_layers * p->seq_len * kv_size * sizeof(half));
     cudaMalloc((void**)&s->logits_temp, p->vocab_size * sizeof(float));
     s->logits = (float*)malloc(p->vocab_size * sizeof(float));
 
@@ -481,7 +482,7 @@ void matmul_bias(half* xout, half* x, half* w, half* b, int n, int d) {
 
     const half alpha = 1.0f;
     const half beta = 1.0f;
-    cudaMemcpyAsync(xout, b, d*sizeof(half), cudaMemcpyHostToDevice);
+    cudaMemcpyAsync(xout, b, d*sizeof(half), cudaMemcpyDeviceToDevice);
     cublasHgemm(
         handle, CUBLAS_OP_T, CUBLAS_OP_T, dimsA.y, dimsB.x,
         dimsA.x, &alpha, w, dimsA.x, x,
