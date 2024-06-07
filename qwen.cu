@@ -149,7 +149,7 @@ __device__ void softmax_gpu(float* __restrict__ x, int size) {
     int step = blockDim.x;
 
     // find max value (for numerical stability)
-    float max_val = tid < size ? x[tid] : 0;
+    float max_val = tid < size ? x[tid] : -1e6;
     for (int i = tid + step; i < size; i += step)
         if (x[i] > max_val)
             max_val = x[i];
@@ -842,15 +842,15 @@ int main(int argc, char *argv[]) {
     long start = 0;  // used to time our code, only initialized after first iteration
     int next;        // will store the next token in the sequence
     int token = prompt_tokens[0];
-    int pos = 1;     // position in the sequence
+    int pos = 0;     // position in the sequence
     while (pos < steps) {
 
         // forward the transformer to get logits for the next token
         transformer(token, pos, &config, &state, &weights);
 
-        if(pos < num_prompt_tokens) {
+        if(pos < num_prompt_tokens-1) {
             // if we are still processing the input prompt, force the next prompt token
-            next = prompt_tokens[pos];
+            next = prompt_tokens[pos+1];
         } else {
             // sample the next token
             if (temperature == 0.0f) {

@@ -845,15 +845,15 @@ int main(int argc, char *argv[]) {
     long start = 0;  // used to time our code, only initialized after first iteration
     int next;        // will store the next token in the sequence
     int token = prompt_tokens[0];
-    int pos = 1;     // position in the sequence
+    int pos = 0;     // position in the sequence
     while (pos < steps) {
 
         // forward the transformer to get logits for the next token
         transformer(token, pos, &config, &state, &weights);
 
-        if(pos < num_prompt_tokens) {
+        if(pos < num_prompt_tokens-1) {
             // if we are still processing the input prompt, force the next prompt token
-            next = prompt_tokens[pos];
+            next = prompt_tokens[pos+1];
         } else {
             // sample the next token
             if (temperature == 0.0f) {
