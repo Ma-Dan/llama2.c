@@ -6,16 +6,13 @@
     "configurations": [
         {
             "name": "qwen",
-            "type": "cppdbg",
+            "type": "cuda-gdb",
             "request": "launch",
             "program": "${workspaceFolder}/qwen",
-            "args": ["./qwen_chat_0_5b.bin", "0.8", "2048", ""],
+            "args": "./qwen2_instruct_0_5b.bin 0.8 2048",
             "environment": [{"name": "LD_LIBRARY_PATH", "value": ""}],
             "cwd": "${workspaceFolder}",
-            "stopAtEntry": false,
-            "externalConsole": false,
-            "MIMode": "gdb",
-            "miDebuggerPath": "/usr/bin/gdb"
+            "stopAtEntry": false
         },
         {
             "name": "qwen_float",
