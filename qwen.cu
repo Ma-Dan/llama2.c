@@ -176,16 +176,15 @@ __device__ void softmax_gpu(float* __restrict__ x, int size) {
 // Each block processes a single head
 // Poor parallelism and even poorer memory access pattern.
 // Ankan - TODO: optimize this.
-#define MAX_SEQ_LEN 8192
 __global__ void MultiHeadAttention_kernel(half* __restrict__ output, const half* __restrict__ sq,
-    const half* __restrict__ key_cache, const half* __restrict__ value_cache,
+    const half* __restrict__ key_cache, const half* __restrict__ value_cache, float* __restrict__ att_score,
     int num_heads, int num_groups, int head_size, int kv_size, int loff, int seq_len, int dim) {
     int h = blockIdx.x;
 
     // get the query vector for this head
     const half* q = sq + h * head_size;
     // attention scores for this head
-    __shared__ float att[MAX_SEQ_LEN];
+    float* att = att_score + h * seq_len;
 
     // iterate over all timesteps, including the current one
     for (int t = threadIdx.x; t < seq_len; t += blockDim.x) {
@@ -278,6 +277,8 @@ typedef struct {
     // kv cache
     half* key_cache;   // (layer, seq_len, dim)
     half* value_cache; // (layer, seq_len, dim)
+    // attention score
+    float* att_score; // (heads, seq_len)
 } RunState;
 
 void malloc_run_state(RunState* s, Config* p) {
@@ -293,6 +294,7 @@ void malloc_run_state(RunState* s, Config* p) {
     cudaMalloc((void**)&s->logits_gpu, p->vocab_size * sizeof(half));
     cudaMalloc((void**)&s->key_cache, p->n_layers * p->seq_len * kv_size * sizeof(half));    // potentially huge allocs
     cudaMalloc((void**)&s->value_cache, p->n_layers * p->seq_len * kv_size * sizeof(half));
+    cudaMalloc((void**)&s->att_score, p->n_heads * p->seq_len * sizeof(float));
     cudaMalloc((void**)&s->logits_temp, p->vocab_size * sizeof(float));
     s->logits = (float*)malloc(p->vocab_size * sizeof(float));
 
@@ -319,6 +321,7 @@ void free_run_state(RunState* s) {
     free(s->logits);
     cudaFree(s->key_cache);
     cudaFree(s->value_cache);
+    cudaFree(s->att_score);
 }
 
 void malloc_weights(TransformerWeights* w, Config* p, int shared_weights) {
@@ -494,9 +497,9 @@ void RoPERotation(half *qk, half *f_real, half *f_imag, int num_heads, int head_
     RoPERotation_kernel <<<num_heads, head_size / 2 >>> (qk, f_real, f_imag, num_heads, head_size);
 }
 
-void MultiHeadAttention(half *output, half *q, half *key_cache, half *value_cache, int num_heads, int num_groups, int head_size, int kv_size, int loff, int seq_len) {
+void MultiHeadAttention(half *output, half *q, half *key_cache, half *value_cache, float* att_score, int num_heads, int num_groups, int head_size, int kv_size, int loff, int seq_len) {
     int dim = head_size * num_heads;
-    MultiHeadAttention_kernel <<<num_heads, 1024>>> (output, q, key_cache, value_cache, num_heads, num_groups, head_size, kv_size, loff, seq_len, dim);
+    MultiHeadAttention_kernel <<<num_heads, 1024>>> (output, q, key_cache, value_cache, att_score, num_heads, num_groups, head_size, kv_size, loff, seq_len, dim);
 }
 
 void siluElementwiseMul(half *hb, half *hb2, int size) {
@@ -542,7 +545,7 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
         cudaMemcpyAsync(key_cache_row, s->k, kv_size * sizeof(half), cudaMemcpyDeviceToDevice);
         cudaMemcpyAsync(value_cache_row, s->v, kv_size * sizeof(half), cudaMemcpyDeviceToDevice);
 
-        MultiHeadAttention(s->xb, s->q, s->key_cache, s->value_cache, p->n_heads, p->n_gqa_groups, head_size, kv_size, loff, pos+1);
+        MultiHeadAttention(s->xb, s->q, s->key_cache, s->value_cache, s->att_score, p->n_heads, p->n_gqa_groups, head_size, kv_size, loff, pos+1);
 
         // final matmul to get the output of the attention
         matmul(s->xb2, s->xb, w->wo + l * dim * dim, dim, dim);
@@ -814,7 +817,7 @@ int main(int argc, char *argv[]) {
         if (!file) { printf("couldn't load tokenizer.bin\n"); return 1; }
         if (fread(&max_token_length, sizeof(int), 1, file) != 1) { printf("failed read\n"); return 1; }
         int len;
-        for (int i = 0; i < config.vocab_size; i++) {
+        for (int i = 0; i < 151936; i++) {
             if (fread(vocab_scores + i, sizeof(float), 1, file) != 1) { printf("failed read\n"); return 1;}
             if (fread(&len, sizeof(int), 1, file) != 1) { printf("failed read\n"); return 1; }
             vocab[i] = (char *)malloc(len + 1);
