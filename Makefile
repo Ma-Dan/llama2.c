@@ -83,6 +83,10 @@ qwen: qwen.cu
 qwen_float: qwen_float.cu
 	$(NVCC) $(NVCCFLAGS) $(subst -Ofast,-O3,$(CXXFLAGS)) -lcublas -lculibos -lcudart -lcublasLt -L/usr/local/cuda/lib64 -L/opt/cuda/lib64 -L$(CUDA_PATH)/targets/x86_64-linux/lib $< -o $@
 
+.PHONY: qwen_asr
+qwen_asr: qwen_asr.cu
+	$(NVCC) $(NVCCFLAGS) $(subst -Ofast,-O3,$(CXXFLAGS)) -lcublas -lculibos -lcudart -lcublasLt -L/usr/local/cuda/lib64 -L/opt/cuda/lib64 -L$(CUDA_PATH)/targets/x86_64-linux/lib $< -o $@
+
 .PHONY: clean
 clean:
 	rm -f run
