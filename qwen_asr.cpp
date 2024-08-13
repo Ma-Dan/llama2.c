@@ -190,41 +190,58 @@ int main(int argc, char** argv) {
     void* transformer;
     int seq_len = build_transformer(model_path.c_str(), &transformer);
 
-    // 使用onnx运行encoder
-    vector<const char*> input_names{ "mel" };
-    vector<const char*> output_names{ "audio_features" };
-
-    Ort::Value input_tensor_{ nullptr };
-    Ort::Value output_tensor_{ nullptr };
+    // 使用onnx运行encoder和projector
     Ort::SessionOptions session_option;
     Ort::Env env{ ORT_LOGGING_LEVEL_WARNING, "qwen_asr" };
-    Ort::Session session{ nullptr };
+    Ort::Session session_encoder{ nullptr };
+    Ort::Session session_projector{ nullptr };
     auto allocator_info = Ort::MemoryInfo::CreateCpu(OrtDeviceAllocator, OrtMemTypeCPU);
 
-    // 加载mel
-    std::array<float, 1 * 80 * 3000> input_;
-    std::array<float, 1 * 1500 * 384> output_;
-    std::array<int64_t, 3> input_shape_{ 1, 80, 3000 };
-    std::array<int64_t, 3> output_shape_{ 1, 1500, 384 };
+    // Onnx whisper encoder
+    vector<const char*> encoder_input_names{ "mel" };
+    vector<const char*> encoder_output_names{ "audio_features" };
 
+    std::array<float, 1 * 80 * 3000> encoder_input_;
+    std::array<float, 1 * 1500 * 384> encoder_output_;
+    std::array<int64_t, 3> encoder_input_shape_{ 1, 80, 3000 };
+    std::array<int64_t, 3> encoder_output_shape_{ 1, 1500, 384 };
+
+    Ort::Value encoder_input_tensor_{ nullptr };
+    Ort::Value encoder_output_tensor_{ nullptr };
+
+    // Onnx projector
+    vector<const char*> projector_input_names{ "input" };
+    vector<const char*> projector_output_names{ "output" };
+
+    std::array<float, 1 * 300 * 896> projector_output_;
+    std::array<int64_t, 3> projector_input_shape_{ 1, 1500, 384 };
+    std::array<int64_t, 3> projector_output_shape_{ 1, 300, 896 };
+
+    Ort::Value projector_input_tensor_{ nullptr };
+    Ort::Value projector_output_tensor_{ nullptr };
+
+    // 加载mel
     FILE *finput = fopen("mel_float.bin", "rb");
-    fread(input_.data(), sizeof(float), 80 * 3000, finput);
+    fread(encoder_input_.data(), sizeof(float), 80 * 3000, finput);
     fclose(finput);
 
-    input_tensor_ = Ort::Value::CreateTensor<float>(allocator_info, input_.data(), input_.size(), input_shape_.data(), input_shape_.size());
-    output_tensor_ = Ort::Value::CreateTensor<float>(allocator_info, output_.data(), output_.size(), output_shape_.data(), output_shape_.size());
+    // 计算encoder
+    encoder_input_tensor_ = Ort::Value::CreateTensor<float>(allocator_info, encoder_input_.data(), encoder_input_.size(), encoder_input_shape_.data(), encoder_input_shape_.size());
+    encoder_output_tensor_ = Ort::Value::CreateTensor<float>(allocator_info, encoder_output_.data(), encoder_output_.size(), encoder_output_shape_.data(), encoder_output_shape_.size());
 
-    session = Ort::Session(env, "encoder.onnx", session_option);
-    session.Run(Ort::RunOptions{ nullptr }, input_names.data(), &input_tensor_, 1, output_names.data(), &output_tensor_, 1);
+    session_encoder = Ort::Session(env, "encoder.onnx", session_option);
+    session_encoder.Run(Ort::RunOptions{ nullptr }, encoder_input_names.data(), &encoder_input_tensor_, 1, encoder_output_names.data(), &encoder_output_tensor_, 1);
+
+    // 计算projector
+    projector_input_tensor_ = Ort::Value::CreateTensor<float>(allocator_info, encoder_output_.data(), encoder_output_.size(), projector_input_shape_.data(), projector_input_shape_.size());
+    projector_output_tensor_ = Ort::Value::CreateTensor<float>(allocator_info, projector_output_.data(), projector_output_.size(), projector_output_shape_.data(), projector_output_shape_.size());
+
+    session_projector = Ort::Session(env, "projector.onnx", session_option);
+    session_projector.Run(Ort::RunOptions{ nullptr }, projector_input_names.data(), &projector_input_tensor_, 1, projector_output_names.data(), &projector_output_tensor_, 1);
 
     // speech + prompt embedding
     vector<int> tokens(seq_len, 0);
     int num_prompt_tokens = 324;
-    int dim = 896;
-    float* emb_input = (float*)malloc(num_prompt_tokens * dim * sizeof(float));
-    finput = fopen("speech_float.bin", "rb");
-    fread(emb_input, sizeof(float), 300 * 896, finput);
-    fclose(finput);
 
     string transcribe_prompt = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nTrascribe the speech<|im_end|>\n<|im_start|>assistant\n";
 
@@ -242,7 +259,7 @@ int main(int argc, char** argv) {
 
     for (; pos < 512; pos++) {
       if(pos < 300) {
-        run_transformer(-1, emb_input, pos, logits.data(), transformer);
+        run_transformer(-1, projector_output_.data(), pos, logits.data(), transformer);
       } else {
         run_transformer(tokens[pos], NULL, pos, logits.data(), transformer);
       }
@@ -258,8 +275,6 @@ int main(int argc, char** argv) {
 
     gettimeofday(&tve, NULL);
     printf("(%ld tokens/s)\n", pos*1000000/((tve.tv_sec*1000000+tve.tv_usec)-(tvs.tv_sec*1000000+tvs.tv_usec)));
-
-    free(emb_input);
 
     free_transformer(transformer);
 
