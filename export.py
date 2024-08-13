@@ -119,8 +119,12 @@ def legacy_export(model, filepath):
     # final rmsnorm
     serialize_fp32(out_file, model.norm.weight)
     # freqs_cis
-    serialize_fp32(out_file, model.freqs_cos[:p.max_seq_len])
-    serialize_fp32(out_file, model.freqs_sin[:p.max_seq_len])
+    dim = p.dim // p.n_heads
+    inv_freq = 1.0 / (1000000 ** (torch.arange(0, dim, 2, dtype=torch.int64).float() / dim))
+    t = torch.arange(p.max_seq_len, dtype=torch.int64).float()
+    freqs = torch.outer(t, inv_freq)
+    serialize_fp32(out_file, torch.cos(freqs))
+    serialize_fp32(out_file, torch.sin(freqs))
 
     # final classifier weights
     if not shared_classifier:
