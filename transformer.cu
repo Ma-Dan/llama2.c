@@ -272,6 +272,7 @@ typedef struct {
     half* k; // key (dim,)
     half* v; // value (dim,)
     half* logits_gpu; // output logits
+    float* embedding_temp; // embedding in GPU memory converted to half
     float* logits_temp; // logits in GPU memory converted to float
     float* logits; // logits copied CPU side
     // kv cache
@@ -295,6 +296,7 @@ void malloc_run_state(RunState* s, Config* p) {
     cudaMalloc((void**)&s->key_cache, p->n_layers * p->seq_len * kv_size * sizeof(half));    // potentially huge allocs
     cudaMalloc((void**)&s->value_cache, p->n_layers * p->seq_len * kv_size * sizeof(half));
     cudaMalloc((void**)&s->att_score, p->n_heads * p->seq_len * sizeof(float));
+    cudaMalloc((void**)&s->embedding_temp, p->dim * sizeof(float));
     cudaMalloc((void**)&s->logits_temp, p->vocab_size * sizeof(float));
     s->logits = (float*)malloc(p->vocab_size * sizeof(float));
 
@@ -317,6 +319,7 @@ void free_run_state(RunState* s) {
     cudaFree(s->k);
     cudaFree(s->v);
     cudaFree(s->logits_gpu);
+    cudaFree(s->embedding_temp);
     cudaFree(s->logits_temp);
     free(s->logits);
     cudaFree(s->key_cache);
@@ -506,7 +509,7 @@ void siluElementwiseMul(half *hb, half *hb2, int size) {
    silu_element_wise_mul_kernel <<<divUp(size, 256), 256 >>> (hb, hb2, size);
 }
 
-void transformer(int token, half* embedding, int pos, Config* p, RunState* s, TransformerWeights* w) {
+void transformer(int token, float* embedding, int pos, Config* p, RunState* s, TransformerWeights* w) {
 
     // a few convenience variables
     half* x = s->x;
@@ -517,7 +520,8 @@ void transformer(int token, half* embedding, int pos, Config* p, RunState* s, Tr
 
     // copy the token embedding into x
     if(token == -1) {
-        cudaMemcpyAsync(x, &embedding[pos * dim], dim * sizeof(half), cudaMemcpyHostToDevice);
+        cudaMemcpyAsync(s->embedding_temp, &embedding[pos * dim], dim * sizeof(float), cudaMemcpyHostToDevice);
+        convert_fp32_to_fp16 <<<divUp(dim, 256), 256 >>> (x, s->embedding_temp, dim);
     } else {
         half* content_row = &(w->token_embedding_table[token * dim]);
         cudaMemcpyAsync(x, content_row, dim * sizeof(half), cudaMemcpyDeviceToDevice);
@@ -793,12 +797,12 @@ int build_transformer(const char* checkpoint, void** p) {
     return config->seq_len;
 }
 
-void run_transformer(int token, void* embedding, int pos, float* logits, void* p) {
+void run_transformer(int token, float* embedding, int pos, float* logits, void* p) {
     Transformer* t = (Transformer*)p;
     Config* config = &(t->config);
     TransformerWeights* weights = &(t->weights);
     RunState* state = &(t->state);
-    transformer(token, (half*)embedding, pos, config, state, weights);
+    transformer(token, embedding, pos, config, state, weights);
     memcpy(logits, t->state.logits, t->config.vocab_size*sizeof(float));
 }
 

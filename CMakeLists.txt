@@ -18,6 +18,7 @@ set(
 include_directories(
     kernels
     utility
+    onnxruntime-linux-x64-1.18.1/include
     )
 
 set(ABSL_ENABLE_INSTALL ON)
@@ -32,5 +33,5 @@ set(EXECUTABLE_OUTPUT_PATH ../)
 add_compile_options(-g -Ofast -fopenmp)
 
 cuda_add_executable(qwen_asr qwen_asr.cpp transformer.cu)
-target_link_directories(qwen_asr PUBLIC /usr/local/cuda/lib64 /opt/cuda/lib64 $(CUDA_PATH)/targets/x86_64-linux/lib)
-target_link_libraries(qwen_asr cublas culibos cudart cublasLt omp5 re2::re2)
+target_link_directories(qwen_asr PUBLIC /usr/local/cuda/lib64 /opt/cuda/lib64 $(CUDA_PATH)/targets/x86_64-linux/lib onnxruntime-linux-x64-1.18.1/lib)
+target_link_libraries(qwen_asr cublas culibos cudart cublasLt omp5 re2::re2 onnxruntime)

@@ -14,6 +14,7 @@
 
 #include "base64.h"
 #include "tiktoken.h"
+#include <onnxruntime_cxx_api.h>
 
 using namespace std;
 
@@ -166,10 +167,10 @@ int sample(const std::vector<float>& logits, float temp, float topp, int topk) {
 }
 
 int build_transformer(const char* checkpoint, void** p);
-void run_transformer(int token, void* embedding, int pos, float* logits, void* p);
+void run_transformer(int token, float* embedding, int pos, float* logits, void* p);
 void free_transformer(void* p);
 
-// ./inference MODEL PROMPT
+
 int main(int argc, char** argv) {
     if (argc != 4) {
         std::cerr << "Usage: " << argv[0] << " MODEL PROMPT TEMPERATURE"
@@ -189,15 +190,49 @@ int main(int argc, char** argv) {
     void* transformer;
     int seq_len = build_transformer(model_path.c_str(), &transformer);
 
-    vector<int> tokens(seq_len, 0);
+    // 使用onnx运行encoder
+    vector<const char*> input_names{ "mel" };
+    vector<const char*> output_names{ "audio_features" };
 
-    // read speech + prompt embedding
+    Ort::Value input_tensor_{ nullptr };
+    Ort::Value output_tensor_{ nullptr };
+    Ort::SessionOptions session_option;
+    Ort::Env env{ ORT_LOGGING_LEVEL_WARNING, "qwen_asr" };
+    Ort::Session session{ nullptr };
+    auto allocator_info = Ort::MemoryInfo::CreateCpu(OrtDeviceAllocator, OrtMemTypeCPU);
+
+    // 加载mel
+    std::array<float, 1 * 80 * 3000> input_;
+    std::array<float, 1 * 1500 * 384> output_;
+    std::array<int64_t, 3> input_shape_{ 1, 80, 3000 };
+    std::array<int64_t, 3> output_shape_{ 1, 1500, 384 };
+
+    FILE *finput = fopen("mel_float.bin", "rb");
+    fread(input_.data(), sizeof(float), 80 * 3000, finput);
+    fclose(finput);
+
+    input_tensor_ = Ort::Value::CreateTensor<float>(allocator_info, input_.data(), input_.size(), input_shape_.data(), input_shape_.size());
+    output_tensor_ = Ort::Value::CreateTensor<float>(allocator_info, output_.data(), output_.size(), output_shape_.data(), output_shape_.size());
+
+    session = Ort::Session(env, "encoder.onnx", session_option);
+    session.Run(Ort::RunOptions{ nullptr }, input_names.data(), &input_tensor_, 1, output_names.data(), &output_tensor_, 1);
+
+    // speech + prompt embedding
+    vector<int> tokens(seq_len, 0);
     int num_prompt_tokens = 324;
     int dim = 896;
-    char* emb_input = (char*)malloc(num_prompt_tokens * dim * sizeof(int16_t));
-    FILE *finput = fopen("speech.bin", "rb");
-    fread(emb_input, sizeof(int16_t), num_prompt_tokens * dim, finput);
+    float* emb_input = (float*)malloc(num_prompt_tokens * dim * sizeof(float));
+    finput = fopen("speech_float.bin", "rb");
+    fread(emb_input, sizeof(float), 300 * 896, finput);
     fclose(finput);
+
+    string transcribe_prompt = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nTrascribe the speech<|im_end|>\n<|im_start|>assistant\n";
+
+    // tokenize prompt
+    auto tokens_prompt = tokenizer->encode(transcribe_prompt, 32);
+    for(int i=0; i<tokens_prompt.size(); i++) {
+      tokens[300+i] = tokens_prompt[i];
+    }
 
     int pos = 0;
     vector<float> logits(vocab_size, 0);
@@ -206,15 +241,14 @@ int main(int argc, char** argv) {
     gettimeofday(&tvs, NULL);
 
     for (; pos < 512; pos++) {
-      if(pos < num_prompt_tokens) {
+      if(pos < 300) {
         run_transformer(-1, emb_input, pos, logits.data(), transformer);
       } else {
         run_transformer(tokens[pos], NULL, pos, logits.data(), transformer);
       }
 
-      tokens[pos+1] = sample(logits, temp, topp, topk);
-
       if(pos >= num_prompt_tokens-1) {
+        tokens[pos+1] = sample(logits, temp, topp, topk);
         if((151643 == tokens[pos+1]) || (151645 == tokens[pos+1])) {
           break;
         }
