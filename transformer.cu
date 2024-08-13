@@ -506,7 +506,7 @@ void siluElementwiseMul(half *hb, half *hb2, int size) {
    silu_element_wise_mul_kernel <<<divUp(size, 256), 256 >>> (hb, hb2, size);
 }
 
-void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights* w) {
+void transformer(int token, half* embedding, int pos, Config* p, RunState* s, TransformerWeights* w) {
 
     // a few convenience variables
     half* x = s->x;
@@ -516,8 +516,12 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
     int kv_size = dim / p->n_gqa_groups;
 
     // copy the token embedding into x
-    half* content_row = &(w->token_embedding_table[token * dim]);
-    cudaMemcpyAsync(x, content_row, dim * sizeof(half), cudaMemcpyDeviceToDevice);
+    if(token == -1) {
+        cudaMemcpyAsync(x, &embedding[pos * dim], dim * sizeof(half), cudaMemcpyHostToDevice);
+    } else {
+        half* content_row = &(w->token_embedding_table[token * dim]);
+        cudaMemcpyAsync(x, content_row, dim * sizeof(half), cudaMemcpyDeviceToDevice);
+    }
 
     // pluck out the "pos" row of freq_cis_real and freq_cis_imag
     half* freq_cis_real_row = w->freq_cis_real + pos * head_size / 2;
@@ -789,12 +793,12 @@ int build_transformer(const char* checkpoint, void** p) {
     return config->seq_len;
 }
 
-void run_transformer(int token, int pos, float* logits, void* p) {
+void run_transformer(int token, void* embedding, int pos, float* logits, void* p) {
     Transformer* t = (Transformer*)p;
     Config* config = &(t->config);
     TransformerWeights* weights = &(t->weights);
     RunState* state = &(t->state);
-    transformer(token, pos, config, state, weights);
+    transformer(token, (half*)embedding, pos, config, state, weights);
     memcpy(logits, t->state.logits, t->config.vocab_size*sizeof(float));
 }
 
