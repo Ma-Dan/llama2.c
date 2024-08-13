@@ -241,14 +241,15 @@ int main(int argc, char** argv) {
 
     // speech + prompt embedding
     vector<int> tokens(seq_len, 0);
-    int num_prompt_tokens = 324;
 
-    string transcribe_prompt = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nTrascribe the speech<|im_end|>\n<|im_start|>assistant\n";
+    int num_speech_tokens = 300;
+
+    string transcribe_prompt = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nTranscribe the speech<|im_end|>\n<|im_start|>assistant\n";
 
     // tokenize prompt
     auto tokens_prompt = tokenizer->encode(transcribe_prompt, 32);
     for(int i=0; i<tokens_prompt.size(); i++) {
-      tokens[300+i] = tokens_prompt[i];
+      tokens[num_speech_tokens+i] = tokens_prompt[i];
     }
 
     int pos = 0;
@@ -258,13 +259,13 @@ int main(int argc, char** argv) {
     gettimeofday(&tvs, NULL);
 
     for (; pos < 512; pos++) {
-      if(pos < 300) {
+      if(pos < num_speech_tokens) {
         run_transformer(-1, projector_output_.data(), pos, logits.data(), transformer);
       } else {
         run_transformer(tokens[pos], NULL, pos, logits.data(), transformer);
       }
 
-      if(pos >= num_prompt_tokens-1) {
+      if(pos >= num_speech_tokens+tokens_prompt.size()-1) {
         tokens[pos+1] = sample(logits, temp, topp, topk);
         if((151643 == tokens[pos+1]) || (151645 == tokens[pos+1])) {
           break;
