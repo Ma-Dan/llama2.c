@@ -18,6 +18,10 @@
 
 using namespace std;
 
+int build_transformer(const char* checkpoint, void** p);
+void run_transformer(int token, float* embedding, int pos, float* logits, void* p);
+void free_transformer(void* p);
+
 const int vocab_size = 151936;
 
 float temp = 1, topp = 0.9;
@@ -166,10 +170,285 @@ int sample(const std::vector<float>& logits, float temp, float topp, int topk) {
     return probs[last].second;
 }
 
-int build_transformer(const char* checkpoint, void** p);
-void run_transformer(int token, float* embedding, int pos, float* logits, void* p);
-void free_transformer(void* p);
 
+// Whisper log mel spectrogram
+#define WHISPER_SAMPLE_RATE 16000
+#define WHISPER_N_FFT       400
+#define WHISPER_N_FFT_HALF  (WHISPER_N_FFT / 2 + 1)
+#define WHISPER_HOP_LENGTH  160
+#define WHISPER_CHUNK_SIZE  30
+#define WHISPER_N_SAMPLES   (WHISPER_SAMPLE_RATE * WHISPER_CHUNK_SIZE)
+
+#define SIN_COS_N_COUNT WHISPER_N_FFT
+
+struct whisper_global_cache {
+    // In FFT, we frequently use sine and cosine operations with the same values.
+    // We can use precalculated values to speed up the process.
+    float sin_vals[SIN_COS_N_COUNT];
+    float cos_vals[SIN_COS_N_COUNT];
+
+    // Hann window (Use cosf to eliminate difference)
+    // ref: https://pytorch.org/docs/stable/generated/torch.hann_window.html
+    // ref: https://github.com/openai/whisper/blob/main/whisper/audio.py#L147
+    float hann_window[WHISPER_N_FFT];
+
+    whisper_global_cache() {
+        fill_sin_cos_table();
+        fill_hann_window(sizeof(hann_window)/sizeof(hann_window[0]), true, hann_window);
+    }
+
+    void fill_sin_cos_table() {
+        for (int i = 0; i < SIN_COS_N_COUNT; i++) {
+            double theta = (2 * M_PI * i) / SIN_COS_N_COUNT;
+            sin_vals[i] = sinf(theta);
+            cos_vals[i] = cosf(theta);
+        }
+    }
+
+    void fill_hann_window(int length, bool periodic, float * output) {
+        int offset = -1;
+        if (periodic) {
+            offset = 0;
+        }
+        for (int i = 0; i < length; i++) {
+            output[i] = 0.5 * (1.0 - cosf((2.0 * M_PI * i) / (length + offset)));
+        }
+    }
+} global_cache;
+
+// naive Discrete Fourier Transform
+// input is real-valued
+// output is complex-valued
+static void dft(const float* in, int N, float* out) {
+    const int sin_cos_step = SIN_COS_N_COUNT / N;
+
+    for (int k = 0; k < N; k++) {
+        float re = 0;
+        float im = 0;
+
+        for (int n = 0; n < N; n++) {
+            int idx = (k * n * sin_cos_step) % (SIN_COS_N_COUNT); // t = 2*M_PI*k*n/N
+            re += in[n]*global_cache.cos_vals[idx]; // cos(t)
+            im -= in[n]*global_cache.sin_vals[idx]; // sin(t)
+        }
+
+        out[k*2 + 0] = re;
+        out[k*2 + 1] = im;
+    }
+}
+
+// Cooley-Tukey FFT
+// poor man's implementation - use something better
+// input is real-valued
+// output is complex-valued
+static void fft(float* in, int N, float* out) {
+    if (N == 1) {
+        out[0] = in[0];
+        out[1] = 0;
+        return;
+    }
+
+    const int half_N = N / 2;
+    if (N - half_N*2 == 1) {
+        dft(in, N, out);
+        return;
+    }
+
+    float* even = in + N;
+    for (int i = 0; i < half_N; ++i) {
+        even[i]= in[2*i];
+    }
+    float* even_fft = out + 2 * N;
+    fft(even, half_N, even_fft);
+
+    float* odd = even;
+    for (int i = 0; i < half_N; ++i) {
+        odd[i] = in[2*i + 1];
+    }
+    float* odd_fft = even_fft + N;
+    fft(odd, half_N, odd_fft);
+
+    const int sin_cos_step = SIN_COS_N_COUNT / N;
+    for (int k = 0; k < half_N; k++) {
+        int idx = k * sin_cos_step; // t = 2*M_PI*k/N
+        float re = global_cache.cos_vals[idx]; // cos(t)
+        float im = -global_cache.sin_vals[idx]; // sin(t)
+
+        float re_odd = odd_fft[2*k + 0];
+        float im_odd = odd_fft[2*k + 1];
+
+        out[2*k + 0] = even_fft[2*k + 0] + re*re_odd - im*im_odd;
+        out[2*k + 1] = even_fft[2*k + 1] + re*im_odd + im*re_odd;
+
+        out[2*(k + half_N) + 0] = even_fft[2*k + 0] - re*re_odd + im*im_odd;
+        out[2*(k + half_N) + 1] = even_fft[2*k + 1] - re*im_odd - im*re_odd;
+    }
+}
+
+struct whisper_filters {
+    int32_t n_mel;
+    int32_t n_fft;
+
+    std::vector<float> data;
+};
+
+struct whisper_mel_data {
+    int n_len;
+    int n_len_org;
+    int n_mel;
+    float * data;
+};
+
+void log_mel_spectrogram(const float * hann, const std::vector<float> & samples, int n_samples, const whisper_filters & filters, whisper_mel_data & mel) {
+    const auto frame_size = WHISPER_N_FFT;
+    const auto frame_step = WHISPER_HOP_LENGTH;
+    std::vector<float> fft_in(frame_size * 2, 0.0);
+    std::vector<float> fft_out(frame_size * 2 * 2 * 2);
+    int n_fft = filters.n_fft;
+
+    // make sure n_fft == 1 + (WHISPER_N_FFT / 2), bin_0 to bin_nyquist
+    assert(n_fft == 1 + (frame_size / 2));
+
+    // calculate FFT only when fft_in are not all zero
+    for (int i=0; i < mel.n_len; i++) {
+        const int offset = i * frame_step;
+
+        // apply Hann window (~10% faster)
+        for (int j = 0; j < std::min(frame_size, n_samples - offset); j++) {
+            fft_in[j] = hann[j] * samples[offset + j];
+        }
+        // fill the rest with zeros
+        if (n_samples - offset < frame_size) {
+            std::fill(fft_in.begin() + (n_samples - offset), fft_in.end(), 0.0);
+        }
+
+        // FFT
+        fft(fft_in.data(), frame_size, fft_out.data());
+
+        // Calculate modulus^2 of complex numbers
+        // Use pow(fft_out[2 * j + 0], 2) + pow(fft_out[2 * j + 1], 2) causes inference quality problem? Interesting.
+        for (int j = 0; j < n_fft; j++) {
+            fft_out[j] = (fft_out[2 * j + 0] * fft_out[2 * j + 0] + fft_out[2 * j + 1] * fft_out[2 * j + 1]);
+        }
+
+        // mel spectrogram
+        for (int j = 0; j < mel.n_mel; j++) {
+            double sum = 0.0;
+
+            // unroll loop (suggested by GH user @lunixbochs)
+            int k = 0;
+            for (k = 0; k < n_fft - 3; k += 4) {
+                sum +=
+                        fft_out[k + 0] * filters.data[j * n_fft + k + 0] +
+                        fft_out[k + 1] * filters.data[j * n_fft + k + 1] +
+                        fft_out[k + 2] * filters.data[j * n_fft + k + 2] +
+                        fft_out[k + 3] * filters.data[j * n_fft + k + 3];
+            }
+
+            // handle n_fft remainder
+            for (; k < n_fft; k++) {
+                sum += fft_out[k] * filters.data[j * n_fft + k];
+            }
+
+            sum = log10(std::max(sum, 1e-10));
+
+            mel.data[j * mel.n_len + i] = sum;
+        }
+    }
+
+    // Otherwise fft_out are all zero
+    double sum = log10(1e-10);
+    for (int i=0; i < mel.n_len; i++) {
+        for (int j = 0; j < mel.n_mel; j++) {
+            mel.data[j * mel.n_len + i] = sum;
+        }
+    }
+}
+
+void calculate_mel(vector<float> ssamples) {
+    //TODO: Read whisper tiny filters data
+    whisper_filters filters;
+    filters.n_mel = 80;
+    filters.n_fft = 1 + WHISPER_N_FFT / 2;
+    filters.data.resize(filters.n_mel * filters.n_fft);
+
+    // Hann window
+    const float * hann = global_cache.hann_window;
+
+    // Calculate the length of padding
+    int64_t stage_1_pad = WHISPER_SAMPLE_RATE * 30;
+    int64_t stage_2_pad = WHISPER_N_FFT / 2;
+
+    const int n_samples = int(ssamples.size());
+    const float * samples = ssamples.data();
+
+    // Initialize a vector and copy data from C array to it.
+    std::vector<float> samples_padded;
+    samples_padded.resize(n_samples + stage_1_pad + stage_2_pad * 2);
+    std::copy(samples, samples + n_samples, samples_padded.begin() + stage_2_pad);
+
+    // pad 30 seconds of zeros at the end of audio (480,000 samples) + reflective pad 200 samples at the end of audio
+    std::fill(samples_padded.begin() + n_samples + stage_2_pad, samples_padded.begin() + n_samples + stage_1_pad + 2 * stage_2_pad, 0);
+
+    // reflective pad 200 samples at the beginning of audio
+    std::reverse_copy(samples + 1, samples + 1 + stage_2_pad, samples_padded.begin());
+
+    whisper_mel_data mel;
+    mel.n_mel     = filters.n_mel;
+    // https://github.com/pytorch/pytorch/blob/main/aten/src/ATen/native/SpectralOps.cpp#L936
+    // Calculate number of frames + remove the last frame
+    mel.n_len     = (samples_padded.size() - WHISPER_N_FFT) / WHISPER_HOP_LENGTH;
+    // Calculate semi-padded sample length to ensure compatibility
+    mel.n_len_org = 1 + (n_samples + stage_2_pad - WHISPER_N_FFT) / WHISPER_HOP_LENGTH;
+
+    std::vector<float> host_mel_data;
+
+    host_mel_data.resize(mel.n_len * mel.n_mel);
+    mel.data = host_mel_data.data();
+
+    log_mel_spectrogram(hann, samples_padded, n_samples + stage_2_pad, filters, mel);
+
+    // clamping and normalization
+    double mmax = -1e20;
+    for (int i = 0; i < mel.n_mel*mel.n_len; i++) {
+        if (mel.data[i] > mmax) {
+            mmax = mel.data[i];
+        }
+    }
+
+    mmax -= 8.0;
+
+    for (int i = 0; i < mel.n_mel*mel.n_len; i++) {
+        if (mel.data[i] < mmax) {
+            mel.data[i] = mmax;
+        }
+
+        mel.data[i] = (mel.data[i] + 4.0)/4.0;
+    }
+
+    if (!host_mel_data.empty()) {
+      for(int i=0; i<100; i++) {
+        printf("%.5f ", host_mel_data[i]);
+      }
+    }
+}
+
+struct wave_header
+{
+    uint8_t  chunk_id[4];      //'RIFF'
+    uint32_t chunk_size;
+    uint8_t  format[4];        //'WAVE'
+    uint8_t  subchunk1_id[4];  //'FMT'
+    uint32_t subchunk1_size;   //PCM = 16
+    uint16_t audio_format;     //PCM = 1
+    uint16_t channels;
+    uint32_t sample_rate;
+    uint32_t byte_rate;
+    uint16_t block_align;      //NumChannels * BitsPerSample / 8
+    uint16_t bit_per_sample;
+    uint8_t  subchunk2_id[4];  //'DATA'
+    int32_t  subchunk2_size;
+};
 
 int main(int argc, char** argv) {
     if (argc != 4) {
@@ -182,6 +461,34 @@ int main(int argc, char** argv) {
     std::string prompt = argv[2];
     std::string tokenizer_path = "qwen.tiktoken";
     temp = std::atof(argv[3]);
+
+    // 读取wave文件
+    FILE *fp = fopen("test.wav", "rb");
+    wave_header header;
+
+    if(!fp) {
+      printf("Open wave file error\n");
+      return 1;
+    }
+
+    fread(&header, sizeof(wave_header), 1, fp);
+
+    vector<int16_t> waveFileData;
+
+    int dataSize = header.subchunk2_size;
+    printf("Wave file dataSize %d\n", dataSize);
+    waveFileData.resize(dataSize/2);
+    fread(waveFileData.data(), dataSize, 1, fp);
+
+    fclose(fp);
+
+    vector<float> waveData;
+    for(int i=0; i<dataSize/2; i++) {
+        waveData.push_back(static_cast<float>(waveFileData[i]));
+    }
+
+    //calculate_mel(waveData);
+    //printf("\n");
 
     // 加载tokenizer
     auto tokenizer = std::make_unique<QwenTokenizer>(tokenizer_path);
