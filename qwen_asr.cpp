@@ -310,7 +310,7 @@ void log_mel_spectrogram(const float * hann, const std::vector<float> & samples,
     assert(n_fft == 1 + (frame_size / 2));
 
     // calculate FFT only when fft_in are not all zero
-    for (int i=0; i < mel.n_len; i++) {
+    for (int i=0; i < std::min(n_samples / frame_step + 1, mel.n_len); i++) {
         const int offset = i * frame_step;
 
         // apply Hann window (~10% faster)
@@ -365,12 +365,15 @@ void log_mel_spectrogram(const float * hann, const std::vector<float> & samples,
     }
 }
 
-void calculate_mel(vector<float> ssamples) {
-    //TODO: Read whisper tiny filters data
+void calculate_mel(vector<float> ssamples, std::vector<float>& host_mel_data, whisper_mel_data& mel) {
+    // Read whisper filter data
     whisper_filters filters;
     filters.n_mel = 80;
     filters.n_fft = 1 + WHISPER_N_FFT / 2;
     filters.data.resize(filters.n_mel * filters.n_fft);
+    FILE* fp = fopen("tiny_filter.bin", "rb");
+    fread(filters.data.data(), sizeof(float), filters.data.size(), fp);
+    fclose(fp);
 
     // Hann window
     const float * hann = global_cache.hann_window;
@@ -393,15 +396,12 @@ void calculate_mel(vector<float> ssamples) {
     // reflective pad 200 samples at the beginning of audio
     std::reverse_copy(samples + 1, samples + 1 + stage_2_pad, samples_padded.begin());
 
-    whisper_mel_data mel;
     mel.n_mel     = filters.n_mel;
     // https://github.com/pytorch/pytorch/blob/main/aten/src/ATen/native/SpectralOps.cpp#L936
     // Calculate number of frames + remove the last frame
     mel.n_len     = (samples_padded.size() - WHISPER_N_FFT) / WHISPER_HOP_LENGTH;
     // Calculate semi-padded sample length to ensure compatibility
     mel.n_len_org = 1 + (n_samples + stage_2_pad - WHISPER_N_FFT) / WHISPER_HOP_LENGTH;
-
-    std::vector<float> host_mel_data;
 
     host_mel_data.resize(mel.n_len * mel.n_mel);
     mel.data = host_mel_data.data();
@@ -426,11 +426,10 @@ void calculate_mel(vector<float> ssamples) {
         mel.data[i] = (mel.data[i] + 4.0)/4.0;
     }
 
-    if (!host_mel_data.empty()) {
-      for(int i=0; i<100; i++) {
-        printf("%.5f ", host_mel_data[i]);
-      }
+    for(int i=0; i<100; i++) {
+      printf("%.5f    ", mel.data[i]);
     }
+    printf("\n");
 }
 
 struct wave_header
@@ -458,12 +457,12 @@ int main(int argc, char** argv) {
     }
 
     std::string model_path = argv[1];
-    std::string prompt = argv[2];
+    std::string file_name = argv[2];
     std::string tokenizer_path = "qwen.tiktoken";
     temp = std::atof(argv[3]);
 
     // 读取wave文件
-    FILE *fp = fopen("test.wav", "rb");
+    FILE *fp = fopen(file_name.c_str(), "rb");
     wave_header header;
 
     if(!fp) {
@@ -476,7 +475,7 @@ int main(int argc, char** argv) {
     vector<int16_t> waveFileData;
 
     int dataSize = header.subchunk2_size;
-    printf("Wave file dataSize %d\n", dataSize);
+    printf("Wave file data size %d\n", dataSize);
     waveFileData.resize(dataSize/2);
     fread(waveFileData.data(), dataSize, 1, fp);
 
@@ -484,11 +483,13 @@ int main(int argc, char** argv) {
 
     vector<float> waveData;
     for(int i=0; i<dataSize/2; i++) {
-        waveData.push_back(static_cast<float>(waveFileData[i]));
+        waveData.push_back(static_cast<float>(waveFileData[i])/32768.0f);
     }
 
-    //calculate_mel(waveData);
-    //printf("\n");
+    std::vector<float> host_mel_data;
+    whisper_mel_data mel;
+
+    calculate_mel(waveData, host_mel_data, mel);
 
     // 加载tokenizer
     auto tokenizer = std::make_unique<QwenTokenizer>(tokenizer_path);
@@ -528,9 +529,9 @@ int main(int argc, char** argv) {
     Ort::Value projector_output_tensor_{ nullptr };
 
     // 加载mel
-    FILE *finput = fopen("mel_float.bin", "rb");
-    fread(encoder_input_.data(), sizeof(float), 80 * 3000, finput);
-    fclose(finput);
+    //FILE *finput = fopen("mel_float.bin", "rb");
+    memcpy(encoder_input_.data(), mel.data, 80 * 3000 * sizeof(float));
+    //fclose(finput);
 
     // 计算encoder
     encoder_input_tensor_ = Ort::Value::CreateTensor<float>(allocator_info, encoder_input_.data(), encoder_input_.size(), encoder_input_shape_.data(), encoder_input_shape_.size());
