@@ -299,18 +299,19 @@ struct whisper_mel_data {
     float * data;
 };
 
-void log_mel_spectrogram(const float * hann, const std::vector<float> & samples, int n_samples, const whisper_filters & filters, whisper_mel_data & mel) {
+void log_mel_spectrogram(int ith, int n_threads, const float * hann, const std::vector<float> & samples, int n_samples, const whisper_filters & filters, whisper_mel_data & mel) {
     const auto frame_size = WHISPER_N_FFT;
     const auto frame_step = WHISPER_HOP_LENGTH;
     std::vector<float> fft_in(frame_size * 2, 0.0);
     std::vector<float> fft_out(frame_size * 2 * 2 * 2);
     int n_fft = filters.n_fft;
+    int i = ith;
 
     // make sure n_fft == 1 + (WHISPER_N_FFT / 2), bin_0 to bin_nyquist
     assert(n_fft == 1 + (frame_size / 2));
 
     // calculate FFT only when fft_in are not all zero
-    for (int i=0; i < std::min(n_samples / frame_step + 1, mel.n_len); i++) {
+    for (; i < std::min(n_samples / frame_step + 1, mel.n_len); i += n_threads) {
         const int offset = i * frame_step;
 
         // apply Hann window (~10% faster)
@@ -358,7 +359,7 @@ void log_mel_spectrogram(const float * hann, const std::vector<float> & samples,
 
     // Otherwise fft_out are all zero
     double sum = log10(1e-10);
-    for (int i=0; i < mel.n_len; i++) {
+    for (; i < mel.n_len; i += n_threads) {
         for (int j = 0; j < mel.n_mel; j++) {
             mel.data[j * mel.n_len + i] = sum;
         }
@@ -406,7 +407,7 @@ void calculate_mel(vector<float> ssamples, std::vector<float>& host_mel_data, wh
     host_mel_data.resize(mel.n_len * mel.n_mel);
     mel.data = host_mel_data.data();
 
-    log_mel_spectrogram(hann, samples_padded, n_samples + stage_2_pad, filters, mel);
+    log_mel_spectrogram(0, 1, hann, samples_padded, n_samples + stage_2_pad, filters, mel);
 
     // clamping and normalization
     double mmax = -1e20;
@@ -425,11 +426,6 @@ void calculate_mel(vector<float> ssamples, std::vector<float>& host_mel_data, wh
 
         mel.data[i] = (mel.data[i] + 4.0)/4.0;
     }
-
-    for(int i=0; i<100; i++) {
-      printf("%.5f    ", mel.data[i]);
-    }
-    printf("\n");
 }
 
 struct wave_header
@@ -529,9 +525,12 @@ int main(int argc, char** argv) {
     Ort::Value projector_output_tensor_{ nullptr };
 
     // 加载mel
-    //FILE *finput = fopen("mel_float.bin", "rb");
-    memcpy(encoder_input_.data(), mel.data, 80 * 3000 * sizeof(float));
-    //fclose(finput);
+    for(int i=0; i<mel.n_mel; i++) {
+      int offset = i * mel.n_len;
+      for(int j=0; j<3000; j++) {
+        encoder_input_.data()[i*3000+j] = mel.data[offset+j];
+      }
+    }
 
     // 计算encoder
     encoder_input_tensor_ = Ort::Value::CreateTensor<float>(allocator_info, encoder_input_.data(), encoder_input_.size(), encoder_input_shape_.data(), encoder_input_shape_.size());
