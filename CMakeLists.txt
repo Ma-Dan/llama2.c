@@ -2,7 +2,9 @@
 cmake_minimum_required(VERSION 2.8.12)
 project(qwen_asr)
 
-find_package(CUDA QUIET REQUIRED)
+set(CUDA_TOOLKIT_ROOT_DIR /usr/local/cuda-11.6)
+
+find_package(CUDA REQUIRED)
 
 # 设置C++编译版本
 set(CMAKE_CXX_STANDARD 17)
