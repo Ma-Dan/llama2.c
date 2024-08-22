@@ -12,9 +12,9 @@ Inference for Llama-2 Transformer model in pure Cuda.
 #include <cuda_runtime_api.h>
 #include <cuda_fp16.h>
 #include <cub/cub.cuh>
-#include <cublas_v2.h>
+//#include <cublas_v2.h>
 
-cublasHandle_t handle;
+/*cublasHandle_t handle;
 
 void createCublas() {
     cublasCreate(&handle);
@@ -22,7 +22,7 @@ void createCublas() {
 
 void destroyCublas() {
     cublasDestroy(handle);
-}
+}*/
 
 // ----------------------------------------------------------------------------
 // GPU kernels
