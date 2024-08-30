@@ -32,9 +32,12 @@ typedef struct {
     vector<int64_t> input_ids;
     vector<int64_t> attention_mask;
     vector<int64_t> position_ids;
+    int past_len;
     vector<vector<float>> past_key_values_key;
     vector<vector<float>> past_key_values_value;
+
     vector<float> logits;
+    int present_len;
 } RunState;
 
 typedef struct {
@@ -48,15 +51,16 @@ void malloc_run_state(RunState* s, Config* p) {
     s->input_ids = vector<int64_t>(p->batch_size * 1);
     s->attention_mask = vector<int64_t>(p->batch_size * 1);
     s->position_ids = vector<int64_t>(p->batch_size * 1);
-
-    s->logits = vector<float>(p->batch_size * p->seq_len * p->vocab_size);
+    s->past_len = 0;
     s->past_key_values_key = vector<vector<float>>(p->n_layers);
     s->past_key_values_value = vector<vector<float>>(p->n_layers);
-
     for(int i=0; i<p->n_layers; i++) {
-        s->past_key_values_key[i] = vector<float>(p->batch_size * p->n_heads * p->seq_len * p->dim);
-        s->past_key_values_value[i] = vector<float>(p->batch_size * p->n_heads * p->seq_len * p->dim);
+        s->past_key_values_key[i] = vector<float>(p->batch_size * p->n_heads * 1 * p->dim);
+        s->past_key_values_value[i] = vector<float>(p->batch_size * p->n_heads * 1 * p->dim);
     }
+
+    s->logits = vector<float>(p->batch_size * 1 * p->vocab_size);
+    s->present_len = 0;
 }
 
 void free_run_state(RunState* s, Config* p) {
@@ -84,7 +88,7 @@ void free_transformer(Transformer* t) {
     free_run_state(&t->state, &t->config);
 }
 
-void forward_transformer(Transformer* t, int token, int pos) {
+void forward_transformer(Transformer* t, vector<int> tokens) {
     vector<const char*> transformer_input_names { "input_ids", "attention_mask", "position_ids",
         "past_key_values_0_key", "past_key_values_0_value", "past_key_values_1_key", "past_key_values_1_value",
         "past_key_values_2_key", "past_key_values_2_value", "past_key_values_3_key", "past_key_values_3_value",
@@ -100,35 +104,45 @@ void forward_transformer(Transformer* t, int token, int pos) {
     RunState* s = &t->state;
 
     int batch_size = c->batch_size;
-    int len = pos+1;
+    int in_len = tokens.size();
+    int past_len = s->past_len;
+    int out_len = past_len + in_len;
 
-    std::array<int64_t, 2> input_ids_shape_{ batch_size, 1 };
-    std::array<int64_t, 2> attention_mask_shape_{ batch_size, 1 };
-    std::array<int64_t, 2> position_ids_shape_{ batch_size, 1 };
-    std::array<int64_t, 4> past_key_values_shape_{ batch_size, c->n_heads, pos, c->dim };
+    std::array<int64_t, 2> input_ids_shape_{ batch_size, in_len };
+    std::array<int64_t, 2> attention_mask_shape_{ batch_size, in_len };
+    std::array<int64_t, 2> position_ids_shape_{ batch_size, in_len };
+    std::array<int64_t, 4> past_key_values_shape_{ batch_size, c->n_heads, past_len, c->dim };
 
-    s->input_ids[0] = token;
-    s->attention_mask[0] = 1;
-    s->position_ids[0] = pos;
+    s->input_ids.resize(in_len);
+    s->attention_mask.resize(in_len);
+    s->position_ids.resize(in_len);
+    for(int i=0; i<in_len; i++) {
+        s->input_ids[i] = tokens[i];
+        s->attention_mask[i] = 1;
+        s->position_ids[i] = past_len+i;
+    }
 
     vector<Ort::Value> input_values;
-    input_values.push_back(Ort::Value::CreateTensor<int64_t>(t->allocator_info, s->input_ids.data(), len, input_ids_shape_.data(), input_ids_shape_.size()));
-    input_values.push_back(Ort::Value::CreateTensor<int64_t>(t->allocator_info, s->attention_mask.data(), len, attention_mask_shape_.data(), attention_mask_shape_.size()));
-    input_values.push_back(Ort::Value::CreateTensor<int64_t>(t->allocator_info, s->position_ids.data(), len, position_ids_shape_.data(), position_ids_shape_.size()));
+    input_values.push_back(Ort::Value::CreateTensor<int64_t>(t->allocator_info, s->input_ids.data(), in_len, input_ids_shape_.data(), input_ids_shape_.size()));
+    input_values.push_back(Ort::Value::CreateTensor<int64_t>(t->allocator_info, s->attention_mask.data(), in_len, attention_mask_shape_.data(), attention_mask_shape_.size()));
+    input_values.push_back(Ort::Value::CreateTensor<int64_t>(t->allocator_info, s->position_ids.data(), in_len, position_ids_shape_.data(), position_ids_shape_.size()));
     for(int i=0; i<c->n_layers; i++) {
-        input_values.push_back(Ort::Value::CreateTensor<float>(t->allocator_info, s->past_key_values_key[i].data(), c->n_heads * pos * c->dim, past_key_values_shape_.data(), past_key_values_shape_.size()));
-        input_values.push_back(Ort::Value::CreateTensor<float>(t->allocator_info, s->past_key_values_value[i].data(), c->n_heads * pos * c->dim, past_key_values_shape_.data(), past_key_values_shape_.size()));
+        input_values.push_back(Ort::Value::CreateTensor<float>(t->allocator_info, s->past_key_values_key[i].data(), c->n_heads * past_len * c->dim, past_key_values_shape_.data(), past_key_values_shape_.size()));
+        input_values.push_back(Ort::Value::CreateTensor<float>(t->allocator_info, s->past_key_values_value[i].data(), c->n_heads * past_len * c->dim, past_key_values_shape_.data(), past_key_values_shape_.size()));
     }
 
     auto output_tensors = t->session.Run(Ort::RunOptions{ nullptr }, transformer_input_names.data(), input_values.data(), input_values.size(), transformer_output_names.data(), transformer_output_names.size());
 
-    memcpy(s->logits.data(), output_tensors[0].GetTensorMutableData<float>(), c->vocab_size * sizeof(float));
+    s->present_len = out_len;
+    s->logits.resize(in_len * c->vocab_size);
+    memcpy(s->logits.data(), output_tensors[0].GetTensorMutableData<float>(), in_len * c->vocab_size * sizeof(float));
 
+    s->past_len = out_len;
     for(int i=0; i<c->n_layers; i++) {
-        s->past_key_values_key[i].resize(c->n_heads * len * c->dim);
-        s->past_key_values_value[i].resize(c->n_heads * len * c->dim);
-        memcpy(s->past_key_values_key[i].data(), output_tensors[1+i*2].GetTensorMutableData<float>(), c->n_heads * len * c->dim * sizeof(float));
-        memcpy(s->past_key_values_value[i].data(), output_tensors[2+i*2].GetTensorMutableData<float>(), c->n_heads * len * c->dim * sizeof(float));
+        s->past_key_values_key[i].resize(c->n_heads * out_len * c->dim);
+        s->past_key_values_value[i].resize(c->n_heads * out_len * c->dim);
+        memcpy(s->past_key_values_key[i].data(), output_tensors[1+i*2].GetTensorMutableData<float>(), c->n_heads * out_len * c->dim * sizeof(float));
+        memcpy(s->past_key_values_value[i].data(), output_tensors[2+i*2].GetTensorMutableData<float>(), c->n_heads * out_len * c->dim * sizeof(float));
     }
 }
 
@@ -531,26 +545,29 @@ void generate(Transformer* transformer, Tokenizer *tokenizer, Sampler *sampler, 
     }
 
     // start the main loop
+    Config* c = &transformer->config;
+    RunState* s = &transformer->state;
+
     long start = 0;  // used to time our code, only initialized after first iteration
+    // init the timer here because the first iteration can be slower
+    if (start == 0) { start = time_in_ms(); }
+
+    //Prefill prompt tokens
+    safe_printf(prompt); // same as printf("%s", piece), but skips "unsafe" bytes
+    fflush(stdout);
+    vector<int> prompt_token;
+    for(int i=0; i<num_prompt_tokens; i++) {
+        prompt_token.push_back(prompt_tokens[i]);
+    }
+    forward_transformer(transformer, prompt_token);
+
+    //Decode autoregressively
     int next;        // will store the next token in the sequence
-    int token = prompt_tokens[0]; // kick off with the first token in the prompt
-    int pos = 0;     // position in the sequence
+    int token = prompt_token[prompt_token.size()-1];
+    int pos = num_prompt_tokens;     // position in the sequence
+    next = sample(sampler, &transformer->state.logits.data()[(prompt_token.size()-1)*c->vocab_size]);
 
     while (pos < steps) {
-
-        // forward the transformer to get logits for the next token
-        forward_transformer(transformer, token, pos);
-
-        // advance the state machine
-        if (pos < num_prompt_tokens - 1) {
-            // if we are still processing the input prompt, force the next prompt token
-            next = prompt_tokens[pos + 1];
-        } else {
-            // otherwise sample the next token from the logits
-            next = sample(sampler, transformer->state.logits.data());
-        }
-        pos++;
-
         // data-dependent terminating condition: the BOS (=1) token delimits sequences
         if (next == 1) { break; }
 
@@ -560,8 +577,11 @@ void generate(Transformer* transformer, Tokenizer *tokenizer, Sampler *sampler, 
         fflush(stdout);
         token = next;
 
-        // init the timer here because the first iteration can be slower
-        if (start == 0) { start = time_in_ms(); }
+        // forward the transformer to get logits for the next token
+        vector<int> tokens {token};
+        forward_transformer(transformer, tokens);
+        next = sample(sampler, &transformer->state.logits.data()[(tokens.size()-1)*c->vocab_size]);
+        pos++;
     }
     printf("\n");
 
