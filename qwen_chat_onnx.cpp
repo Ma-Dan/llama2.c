@@ -361,6 +361,8 @@ int main(int argc, char** argv) {
     auto tokens = tokenizer->encode(prompt, prompt.length());
     int pos = tokens.size();
 
+    bool prefill = true;
+
     while(1) {
       std::cout << "User: " << std::flush;
       string user_input;
@@ -373,11 +375,18 @@ int main(int argc, char** argv) {
       for(int i=0; i<tokens_input.size(); i++) {
         tokens.push_back(tokens_input[i]);
       }
-      forward_transformer(&transformer, tokens);
+      if(prefill) {
+        forward_transformer(&transformer, tokens);
+        prefill = false;
+      } else {
+        for(int i=0; i<tokens.size(); i++) {
+          forward_transformer(&transformer, vector<int>{tokens[i]});
+        }
+      }
+
       pos += tokens_input.size();
 
       std::cout << "AI: " << std::flush;
-      int output_length = 0;
 
       struct timeval tvs, tve;
       gettimeofday(&tvs, NULL);
@@ -387,14 +396,13 @@ int main(int argc, char** argv) {
       // feed forward
       vector<float> logits(c->vocab_size, 0);
       for (; pos < c->seq_len; pos++) {
-        memcpy(logits.data(), &transformer.state.logits.data()[(tokens.size()-1)*c->vocab_size], c->vocab_size);
+        memcpy(logits.data(), &transformer.state.logits.data()[transformer.state.logits.size() - c->vocab_size], c->vocab_size * sizeof(float));
         int next = sample(logits, temp, topp, topk);
         tokens.clear();
         tokens.push_back(next);
 
         out_count++;
 
-        output_length++;
         std::cout << tokenizer->decode({next}) << std::flush;
         if((151643 == next) || (151645 == next)) {
           std::cout << std::endl;
