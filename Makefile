@@ -14,6 +14,9 @@ rundebug: run.c
 	$(CC) -g -o run run.c -lm
 	$(CC) -g -o runq runq.c -lm
 
+quant_test: quant_test.c
+	$(CC) -g -o quant_test quant_test.c -lm
+
 # https://gcc.gnu.org/onlinedocs/gcc/Optimize-Options.html
 # https://simonbyrne.github.io/notes/fastmath/
 # -Ofast enables all -O3 optimizations.
