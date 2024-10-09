@@ -1,10 +1,21 @@
 import argparse
+import struct
 import torch
 import numpy as np
 
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from transformers import StoppingCriteria, StoppingCriteriaList
 
+def serialize_fp32(file, tensor):
+    d = tensor.flatten()
+    """ writes one fp32 tensor to file that is open in wb mode """
+    b = struct.pack(f'{len(d)}f', *d)
+    file.write(b)
+
+def serialize_uint8(file, tensor):
+    """ writes one uint8 tensor to file that is open in wb mode """
+    b = struct.pack(f'{len(tensor)}B', *tensor)
+    file.write(b)
 
 def quant(weight, quant_bit, quant_block):
     weight = weight.numpy()
@@ -54,10 +65,23 @@ def main():
 
     x = model.model.embed_tokens(id).detach()
 
+    x_file = open("x.bin", 'wb')
+    serialize_fp32(x_file, x.numpy())
+    x_file.close()
+
     golden = model.model.layers[0].self_attn.q_proj(x).detach().numpy()
+
+    golden_file = open("golden.bin", 'wb')
+    serialize_fp32(golden_file, golden)
+    golden_file.close()
 
     # 量化weight
     q_weight, alpha, clip_min = quant(weight, quant_bit, 0)
+
+    weight_file = open("weight.bin", 'wb')
+    serialize_uint8(weight_file, q_weight)
+    serialize_fp32(weight_file, alpha)
+    weight_file.close()
 
     # 量化activation
     q_x, s_x = quant_absmax(x)
