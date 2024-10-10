@@ -84,8 +84,9 @@ def legacy_export(model, filepath):
     if not shared_classifier:
         p.vocab_size = -p.vocab_size
     n_kv_heads = p.n_heads if p.n_kv_heads is None else p.n_kv_heads
-    header = struct.pack('iiiiiii', p.dim, hidden_dim, p.n_layers, p.n_heads,
-                                    n_kv_heads, p.vocab_size, p.max_seq_len)
+    n_gqa_groups = p.dim // model.layers[0].attention.wk.weight.shape[0]
+    header = struct.pack('iiiiiiii', p.dim, hidden_dim, p.n_layers, p.n_heads,
+                                    n_kv_heads, n_gqa_groups, p.vocab_size, p.max_seq_len)
     out_file.write(header)
 
     # next write out the embedding weights
@@ -97,10 +98,13 @@ def legacy_export(model, filepath):
         serialize_fp32(out_file, layer.attention_norm.weight)
     for layer in model.layers:
         serialize_fp32(out_file, layer.attention.wq.weight)
+        serialize_fp32(out_file, layer.attention.wq.bias)
     for layer in model.layers:
         serialize_fp32(out_file, layer.attention.wk.weight)
+        serialize_fp32(out_file, layer.attention.wk.bias)
     for layer in model.layers:
         serialize_fp32(out_file, layer.attention.wv.weight)
+        serialize_fp32(out_file, layer.attention.wv.bias)
     for layer in model.layers:
         serialize_fp32(out_file, layer.attention.wo.weight)
     # ffn weights
@@ -115,8 +119,12 @@ def legacy_export(model, filepath):
     # final rmsnorm
     serialize_fp32(out_file, model.norm.weight)
     # freqs_cis
-    serialize_fp32(out_file, model.freqs_cos[:p.max_seq_len])
-    serialize_fp32(out_file, model.freqs_sin[:p.max_seq_len])
+    dim = p.dim // p.n_heads
+    inv_freq = 1.0 / (1000000 ** (torch.arange(0, dim, 2, dtype=torch.int64).float() / dim))
+    t = torch.arange(p.max_seq_len, dtype=torch.int64).float()
+    freqs = torch.outer(t, inv_freq)
+    serialize_fp32(out_file, torch.cos(freqs))
+    serialize_fp32(out_file, torch.sin(freqs))
 
     # final classifier weights
     if not shared_classifier:
@@ -464,16 +472,15 @@ def load_hf_model(model_path):
     model.tok_embeddings.weight = nn.Parameter(hf_dict['model.embed_tokens.weight'])
     model.norm.weight = nn.Parameter(hf_dict['model.norm.weight'])
 
-    # huggingface permutes WQ and WK, this function reverses it
-    def permute_reverse(w, n_heads=config.n_heads, dim1=config.dim, dim2=config.dim):
-        return w.view(n_heads, 2, dim1 // n_heads // 2, dim2).transpose(1, 2).reshape(dim1, dim2)
-
     for layer in model.layers:
         i = layer.layer_id
         layer.attention_norm.weight = nn.Parameter(hf_dict[f'model.layers.{i}.input_layernorm.weight'])
-        layer.attention.wq.weight = nn.Parameter(permute_reverse(hf_dict[f'model.layers.{i}.self_attn.q_proj.weight']))
-        layer.attention.wk.weight = nn.Parameter(permute_reverse(hf_dict[f'model.layers.{i}.self_attn.k_proj.weight']))
+        layer.attention.wq.weight = nn.Parameter(hf_dict[f'model.layers.{i}.self_attn.q_proj.weight'])
+        layer.attention.wq.bias = nn.Parameter(hf_dict[f'model.layers.{i}.self_attn.q_proj.bias'])
+        layer.attention.wk.weight = nn.Parameter(hf_dict[f'model.layers.{i}.self_attn.k_proj.weight'])
+        layer.attention.wk.bias = nn.Parameter(hf_dict[f'model.layers.{i}.self_attn.k_proj.bias'])
         layer.attention.wv.weight = nn.Parameter(hf_dict[f'model.layers.{i}.self_attn.v_proj.weight'])
+        layer.attention.wv.bias = nn.Parameter(hf_dict[f'model.layers.{i}.self_attn.v_proj.bias'])
         layer.attention.wo.weight = nn.Parameter(hf_dict[f'model.layers.{i}.self_attn.o_proj.weight'])
         layer.ffn_norm.weight = nn.Parameter(hf_dict[f'model.layers.{i}.post_attention_layernorm.weight'])
         layer.feed_forward.w1.weight = nn.Parameter(hf_dict[f'model.layers.{i}.mlp.gate_proj.weight'])
