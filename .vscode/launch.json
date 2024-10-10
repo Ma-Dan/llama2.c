@@ -22,11 +22,38 @@
             ]
         },
         {
+            "name": "qwen_chat_q",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/qwen_chat_q",
+            "args": ["qwen2_5_0_5b_q_instruct.bin", "", "0.85"],
+            "environment": [{"name": "OMP_NUM_THREADS", "value": "1"}],
+            "cwd": "${workspaceFolder}",
+            "stopAtEntry": false,
+            "externalConsole": false,
+            "MIMode": "gdb",
+            "miDebuggerPath": "/usr/bin/gdb",
+            "setupCommands": [
+                { "text": "-enable-pretty-printing", "description": "enable pretty printing", "ignoreFailures": true },
+                { "text": "handle SIGPIPE nostop noprint pass", "description": "ignore SIGPIPE", "ignoreFailures": true }
+            ]
+        },
+        {
             "name": "export qwen",
             "type": "debugpy",
             "request": "launch",
             "program": "export.py",
             "args": ["--hf", "/mnt/d/Models/LLM/Qwen2.5-0.5B-Instruct", "./qwen2_5_0_5b_instruct.bin"],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "env": {}
+        },
+        {
+            "name": "export qwen q8",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "export.py",
+            "args": ["--hf", "/mnt/d/Models/LLM/Qwen2.5-0.5B-Instruct", "--version", "2", "./qwen2_5_0_5b_q_instruct.bin"],
             "console": "integratedTerminal",
             "justMyCode": false,
             "env": {}

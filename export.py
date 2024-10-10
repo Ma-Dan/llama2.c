@@ -211,6 +211,11 @@ def version2_export(model, filepath, group_size=64):
         *[layer.feed_forward.w2.weight for layer in model.layers],
         *[layer.feed_forward.w3.weight for layer in model.layers],
     ]
+    biases = [
+        *[layer.attention.wq.bias for layer in model.layers],
+        *[layer.attention.wk.bias for layer in model.layers],
+        *[layer.attention.wv.bias for layer in model.layers],
+    ]
     shared_classifier = torch.equal(model.tok_embeddings.weight, model.output.weight)
     if not shared_classifier:
         weights.append(model.output.weight)
@@ -228,8 +233,9 @@ def version2_export(model, filepath, group_size=64):
     p = model.params
     hidden_dim = model.layers[0].feed_forward.w1.weight.shape[0]
     n_kv_heads = p.n_heads if p.n_kv_heads is None else p.n_kv_heads
-    header = struct.pack('iiiiiii', p.dim, hidden_dim, p.n_layers, p.n_heads,
-                                    n_kv_heads, p.vocab_size, p.max_seq_len)
+    n_gqa_groups = p.dim // model.layers[0].attention.wk.weight.shape[0]
+    header = struct.pack('iiiiiiii', p.dim, hidden_dim, p.n_layers, p.n_heads,
+                                    n_kv_heads, n_gqa_groups, p.vocab_size, p.max_seq_len)
     out_file.write(header)
     # 4) write some other flags
     out_file.write(struct.pack('B', int(shared_classifier)))
@@ -262,6 +268,17 @@ def version2_export(model, filepath, group_size=64):
     # print the highest error across all weights, should be very small, e.g. O(~0.001)
     ew.sort(reverse=True)
     print(f"max quantization group error across all weights: {ew[0][0]}")
+
+    for i, b in enumerate(biases):
+        serialize_fp32(out_file, b) # save biases
+
+    # freqs_cis
+    dim = p.dim // p.n_heads
+    inv_freq = 1.0 / (1000000 ** (torch.arange(0, dim, 2, dtype=torch.int64).float() / dim))
+    t = torch.arange(p.max_seq_len, dtype=torch.int64).float()
+    freqs = torch.outer(t, inv_freq)
+    serialize_fp32(out_file, torch.cos(freqs))
+    serialize_fp32(out_file, torch.sin(freqs))
 
     # write to binary file
     out_file.close()
