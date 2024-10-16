@@ -5,6 +5,10 @@ project(qwen_chat)
 # 设置C++编译版本
 set(CMAKE_CXX_STANDARD 17)
 
+include_directories(
+    onnxruntime-linux-aarch64-1.19.2/include
+    )
+
 set(ABSL_ENABLE_INSTALL ON)
 set(ABSL_PROPAGATE_CXX_STD ON)
 add_subdirectory(third_party/abseil-cpp)
@@ -15,7 +19,6 @@ set(EXECUTABLE_OUTPUT_PATH ../)
 
 add_compile_options(-g -Ofast -fopenmp)
 
-add_executable(qwen_chat qwen_chat.cpp)
-target_link_libraries(qwen_chat omp5 re2::re2)
-add_executable(qwen_chat_q qwen_chat_q.cpp)
-target_link_libraries(qwen_chat_q omp5 re2::re2)
+add_executable(qwen_asr_q qwen_asr_q.cpp)
+target_link_directories(qwen_asr_q PUBLIC onnxruntime-linux-aarch64-1.19.2/lib)
+target_link_libraries(qwen_asr_q omp5 re2::re2 onnxruntime)

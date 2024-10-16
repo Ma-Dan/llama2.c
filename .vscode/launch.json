@@ -5,6 +5,23 @@
     "version": "0.2.0",
     "configurations": [
         {
+            "name": "qwen_asr_q",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/qwen_asr_q",
+            "args": ["qwen2_0_5b_q_instruct.bin", "test.wav", "0.85"],
+            "environment": [{"name": "OMP_NUM_THREADS", "value": "1"}],
+            "cwd": "${workspaceFolder}",
+            "stopAtEntry": false,
+            "externalConsole": false,
+            "MIMode": "gdb",
+            "miDebuggerPath": "/usr/bin/gdb",
+            "setupCommands": [
+                { "text": "-enable-pretty-printing", "description": "enable pretty printing", "ignoreFailures": true },
+                { "text": "handle SIGPIPE nostop noprint pass", "description": "ignore SIGPIPE", "ignoreFailures": true }
+            ]
+        },
+        {
             "name": "qwen_chat",
             "type": "cppdbg",
             "request": "launch",
