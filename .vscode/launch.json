@@ -58,5 +58,22 @@
             "justMyCode": false,
             "env": {}
         },
+        {
+            "name": "matmul_test",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/matmul_test",
+            //"args": [],
+            "environment": [{"name": "OMP_NUM_THREADS", "value": "1"}],
+            "cwd": "${workspaceFolder}",
+            "stopAtEntry": false,
+            "externalConsole": false,
+            "MIMode": "gdb",
+            "miDebuggerPath": "/usr/bin/gdb",
+            "setupCommands": [
+                { "text": "-enable-pretty-printing", "description": "enable pretty printing", "ignoreFailures": true },
+                { "text": "handle SIGPIPE nostop noprint pass", "description": "ignore SIGPIPE", "ignoreFailures": true }
+            ]
+        },
     ]
 }
