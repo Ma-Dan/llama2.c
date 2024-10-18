@@ -12,6 +12,13 @@
     #include <unistd.h>
     #include <sys/mman.h>
 #endif
+#include <sys/time.h>
+
+#define NEON
+
+#ifdef NEON
+#include <arm_neon.h>
+#endif
 
 // ----------------------------------------------------------------------------
 // Globals
@@ -100,6 +107,29 @@ void matmul_float(float* xout, float* x, float* w, int n, int d) {
     }
 }
 
+#ifdef NEON
+
+void gemv_neon_float(float* result, float* x, float* w, int n, int d) {
+    float32x4_t column;
+    float32x4_t element;
+
+    int i;
+    #pragma omp parallel for private(i)
+    for (i = 0; i < d; i++) {
+        float32x4_t sum = vdupq_n_f32(0.0f);
+        for(int j=0; j < n; j+=4) {
+            column = vld1q_f32(w + i * n + j);
+            element = vld1q_f32(x + j);
+            sum = vmlaq_f32(sum, column, element);
+        }
+        float32x2_t sum2 = vpadd_f32(vget_high_f32(sum), vget_low_f32(sum));
+        float rsum = vget_lane_f32(sum2, 0) + vget_lane_f32(sum2, 1);
+        result[i] = rsum;
+    }
+}
+
+#endif
+
 void read_datafile(char* file_name, void* data, size_t offset, size_t size) {
     FILE *file = fopen(file_name, "rb");
 
@@ -149,8 +179,19 @@ int main(int argc, char** argv) {
     fclose(file_weight_q);
     QuantizedTensor* wq = init_quantized_tensors(&weight_q, 1, dim*dim);
 
+    struct timeval tvs, tve;
+    gettimeofday(&tvs, NULL);
+
     // float matmul
-    matmul_float(result, x, weight, dim, dim);
+    for(int i=0; i<1000; i++) {
+#ifdef NEON
+        gemv_neon_float(result, x, weight, dim, dim);
+#else
+        matmul_float(result, x, weight, dim, dim);
+#endif
+    }
+    gettimeofday(&tve, NULL);
+    printf("float %ld ms\n", (tve.tv_sec*1000+tve.tv_usec/1000)-(tvs.tv_sec*1000+tvs.tv_usec/1000));
 
     float diff_max = 0;
     float diff_min = 0;
@@ -162,9 +203,16 @@ int main(int argc, char** argv) {
 
 
     // W8A8 matmul
+    gettimeofday(&tvs, NULL);
+
     QuantizedTensor xq = (QuantizedTensor) { .q = (int8_t*)calloc(dim, sizeof(int8_t)), .s = (float*)calloc(dim, sizeof(float)) };
-    quantize(&xq, x, dim);
-    matmul(result, &xq, wq, dim, dim);
+    for(int i=0; i<1000; i++) {
+        quantize(&xq, x, dim);
+        matmul(result, &xq, wq, dim, dim);
+    }
+    gettimeofday(&tve, NULL);
+    printf("W8A8 %ld ms\n", (tve.tv_sec*1000+tve.tv_usec/1000)-(tvs.tv_sec*1000+tvs.tv_usec/1000));
+
 
     diff_max = 0;
     diff_min = 0;

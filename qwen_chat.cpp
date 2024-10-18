@@ -29,6 +29,12 @@
 #include "base64.h"
 #include "tiktoken.h"
 
+#define NEON
+
+#ifdef NEON
+#include <arm_neon.h>
+#endif
+
 using namespace std;
 
 const int vocab_size = 152064;
@@ -243,6 +249,48 @@ void softmax(float* x, int size) {
     }
 }
 
+#ifdef NEON
+
+void matmul(float* result, float* x, float* w, int n, int d) {
+    float32x4_t column;
+    float32x4_t element;
+
+    int i;
+    #pragma omp parallel for private(i)
+    for (i = 0; i < d; i++) {
+        float32x4_t sum = vdupq_n_f32(0.0f);
+        for(int j=0; j < n; j+=4) {
+            column = vld1q_f32(w + i * n + j);
+            element = vld1q_f32(x + j);
+            sum = vmlaq_f32(sum, column, element);
+        }
+        float32x2_t sum2 = vpadd_f32(vget_high_f32(sum), vget_low_f32(sum));
+        float rsum = vget_lane_f32(sum2, 0) + vget_lane_f32(sum2, 1);
+        result[i] = rsum;
+    }
+}
+
+void matmul_bias(float* result, float* x, float* w, float* b, int n, int d) {
+    float32x4_t column;
+    float32x4_t element;
+
+    int i;
+    #pragma omp parallel for private(i)
+    for (i = 0; i < d; i++) {
+        float32x4_t sum = vdupq_n_f32(0.0f);
+        for(int j = 0; j < n; j+=4) {
+            column = vld1q_f32(w + i * n + j);
+            element = vld1q_f32(x + j);
+            sum = vmlaq_f32(sum, column, element);
+        }
+        float32x2_t sum2 = vpadd_f32(vget_high_f32(sum), vget_low_f32(sum));
+        float rsum = vget_lane_f32(sum2, 0) + vget_lane_f32(sum2, 1);
+        result[i] = rsum + b[i];
+    }
+}
+
+#else
+
 void matmul(float* xout, float* x, float* w, int n, int d) {
     // W (d,n) @ x (n,) -> xout (d,)
     // by far the most amount of time is spent inside this little function
@@ -270,6 +318,8 @@ void matmul_bias(float* xout, float* x, float* w, float* b, int n, int d) {
         xout[i] = val + b[i];
     }
 }
+
+#endif
 
 void RoPERotation(float *sqk, float *f_real, float *f_imag, int num_heads, int head_size) {
     for(int h=0; h<num_heads; h++) {
