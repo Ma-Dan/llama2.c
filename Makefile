@@ -76,5 +76,5 @@ clean:
 	rm -f runq
 
 .PHONY: matmul_test
-matmul_test: matmul_test.c
-	$(CC) -g -O0 -o matmul_test matmul_test.c -lm
+matmul_test: matmul_test.cpp
+	$(CC) -g -O0 -o matmul_test matmul_test.cpp -lm

@@ -90,8 +90,46 @@ void matmul(float* xout, QuantizedTensor *x, QuantizedTensor *w, int n, int d) {
         }
 
         xout[i] = val;
+        //printf("matmul %.5f\n", val);
     }
 }
+
+#ifdef NEON
+
+inline int32x4_t muladd(const int8x16_t & a, const int8x16_t & b)
+{
+    int16x8_t lo = vmull_s8(vget_low_s8(a), vget_low_s8(b));
+    int16x8_t hi = vmull_s8(vget_high_s8(a), vget_high_s8(b));
+    return vaddq_s32(vpaddlq_s16(lo), vpaddlq_s16(hi));
+}
+
+void gemv_neon(float* xout, QuantizedTensor *x, QuantizedTensor *w, int n, int d) {
+    int8x16_t column;
+    int8x16_t element;
+
+    int i;
+    #pragma omp parallel for private(i)
+    for (i = 0; i < d; i++) {
+        float sum = 0.0f;
+        int in = i * n;
+        for(int j = 0; j <= n - GS; j += GS) {
+            int32x4_t sum_gs = vdupq_n_s32(0);
+            for(int k = 0; k < GS; k += 16) {
+                column = vld1q_s8(w->q + in + j + k);
+                element = vld1q_s8(x->q + j + k);
+                sum_gs += muladd(column, element);
+            }
+            int32x2_t sum2 = vpadd_s32(vget_high_s32(sum_gs), vget_low_s32(sum_gs));
+            int rsum = vget_lane_s32(sum2, 0) + vget_lane_s32(sum2, 1);
+            sum += ((float) rsum) * w->s[(in + j) / GS] * x->s[j / GS];
+        }
+
+        xout[i] = sum;
+        //printf("matmuq %.5f\n", sum);
+    }
+}
+
+#endif
 
 void matmul_float(float* xout, float* x, float* w, int n, int d) {
     // W (d,n) @ x (n,) -> xout (d,)
@@ -177,7 +215,7 @@ int main(int argc, char** argv) {
     fseek(file_weight_q, 0, SEEK_SET);
     fread(weight_q, 1, weight_q_len, file_weight_q);
     fclose(file_weight_q);
-    QuantizedTensor* wq = init_quantized_tensors(&weight_q, 1, dim*dim);
+    QuantizedTensor* wq = init_quantized_tensors((void**)&weight_q, 1, dim*dim);
 
     struct timeval tvs, tve;
     gettimeofday(&tvs, NULL);
@@ -206,9 +244,14 @@ int main(int argc, char** argv) {
     gettimeofday(&tvs, NULL);
 
     QuantizedTensor xq = (QuantizedTensor) { .q = (int8_t*)calloc(dim, sizeof(int8_t)), .s = (float*)calloc(dim, sizeof(float)) };
-    for(int i=0; i<1000; i++) {
+    for(int i=0; i<1; i++) {
         quantize(&xq, x, dim);
+#ifdef NEON
         matmul(result, &xq, wq, dim, dim);
+        gemv_neon(result, &xq, wq, dim, dim);
+#else
+        matmul(result, &xq, wq, dim, dim);
+#endif
     }
     gettimeofday(&tve, NULL);
     printf("W8A8 %ld ms\n", (tve.tv_sec*1000+tve.tv_usec/1000)-(tvs.tv_sec*1000+tvs.tv_usec/1000));
