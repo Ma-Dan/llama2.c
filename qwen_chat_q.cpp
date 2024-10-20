@@ -27,7 +27,7 @@
     #include <sys/mman.h>
 #endif
 
-#define NEON
+//#define NEON
 
 #ifdef NEON
 #include <arm_neon.h>
@@ -168,7 +168,10 @@ void free_run_state(RunState* s) {
 // Quantization functions
 
 void dequantize(QuantizedTensor *qx, float* x, int n) {
-    for (int i = 0; i < n; i++) {
+    int i;
+
+    #pragma omp parallel for private(i)
+    for (i = 0; i < n; i++) {
         x[i] = qx->q[i] * qx->s[i / GS];
     }
 }
@@ -177,7 +180,11 @@ void quantize(QuantizedTensor *qx, float* x, int n) {
     int num_groups = n / GS;
     float Q_MAX = 127.0f;
 
-    for (int group = 0; group < num_groups; group++) {
+    int group;
+    int i;
+
+    #pragma omp parallel for private(group, i)
+    for (group = 0; group < num_groups; group++) {
 
         // find the max absolute value in the current group
         float wmax = 0.0;
@@ -193,7 +200,7 @@ void quantize(QuantizedTensor *qx, float* x, int n) {
         qx->s[group] = scale;
 
         // calculate and write the quantized values
-        for (int i = 0; i < GS; i++) {
+        for (i = 0; i < GS; i++) {
             float quant_value = x[group * GS + i] / scale; // scale
             int8_t quantized = (int8_t) round(quant_value); // round and clamp
             qx->q[group * GS + i] = quantized;
@@ -366,11 +373,11 @@ void softmax(float* x, int size) {
 
 #ifdef NEON
 
-inline int32x4_t muladd(const int8x16_t & a, const int8x16_t & b)
+inline void muladd(int32x4_t & sum, const int8x16_t & a, const int8x16_t & b)
 {
     int16x8_t lo = vmull_s8(vget_low_s8(a), vget_low_s8(b));
     int16x8_t hi = vmull_s8(vget_high_s8(a), vget_high_s8(b));
-    return vaddq_s32(vpaddlq_s16(lo), vpaddlq_s16(hi));
+    sum += vaddq_s32(vpaddlq_s16(lo), vpaddlq_s16(hi));
 }
 
 void matmul(float* xout, QuantizedTensor *x, QuantizedTensor *w, int n, int d) {
@@ -387,7 +394,7 @@ void matmul(float* xout, QuantizedTensor *x, QuantizedTensor *w, int n, int d) {
             for(int k = 0; k < GS; k += 16) {
                 column = vld1q_s8(w->q + in + j + k);
                 element = vld1q_s8(x->q + j + k);
-                sum_gs += muladd(column, element);
+                muladd(sum_gs, column, element);
             }
             int32x2_t sum2 = vpadd_s32(vget_high_s32(sum_gs), vget_low_s32(sum_gs));
             int rsum = vget_lane_s32(sum2, 0) + vget_lane_s32(sum2, 1);
@@ -412,7 +419,7 @@ void matmul_bias(float* xout, QuantizedTensor *x, QuantizedTensor *w, float *b, 
             for(int k = 0; k < GS; k += 16) {
                 column = vld1q_s8(w->q + in + j + k);
                 element = vld1q_s8(x->q + j + k);
-                sum_gs += muladd(column, element);
+                muladd(sum_gs, column, element);
             }
             int32x2_t sum2 = vpadd_s32(vget_high_s32(sum_gs), vget_low_s32(sum_gs));
             int rsum = vget_lane_s32(sum2, 0) + vget_lane_s32(sum2, 1);
@@ -433,19 +440,19 @@ void matmul(float* xout, QuantizedTensor *x, QuantizedTensor *w, int n, int d) {
     int i;
     #pragma omp parallel for private(i)
     for (i = 0; i < d; i++) {
-
         float val = 0.0f;
-        int32_t ival = 0;
         int in = i * n;
+        int g_in = i * n / GS;
 
         // do the matmul in groups of GS
-        int j;
-        for (j = 0; j <= n - GS; j += GS) {
+        int g = 0;
+        for (int j = 0; j <= n - GS; j += GS) {
+            int32_t ival = 0;
             for (int k = 0; k < GS; k++) {
                 ival += ((int32_t) x->q[j + k]) * ((int32_t) w->q[in + j + k]);
             }
-            val += ((float) ival) * w->s[(in + j) / GS] * x->s[j / GS];
-            ival = 0;
+            val += ((float) ival) * w->s[g_in + g] * x->s[g];
+            g++;
         }
 
         xout[i] = val;
@@ -460,19 +467,19 @@ void matmul_bias(float* xout, QuantizedTensor *x, QuantizedTensor *w, float *b, 
     int i;
     #pragma omp parallel for private(i)
     for (i = 0; i < d; i++) {
-
         float val = 0.0f;
-        int32_t ival = 0;
         int in = i * n;
+        int g_in = i * n / GS;
 
         // do the matmul in groups of GS
-        int j;
-        for (j = 0; j <= n - GS; j += GS) {
+        int g = 0;
+        for (int j = 0; j <= n - GS; j += GS) {
+            int32_t ival = 0;
             for (int k = 0; k < GS; k++) {
                 ival += ((int32_t) x->q[j + k]) * ((int32_t) w->q[in + j + k]);
             }
-            val += ((float) ival) * w->s[(in + j) / GS] * x->s[j / GS];
-            ival = 0;
+            val += ((float) ival) * w->s[g_in + g] * x->s[g];
+            g++;
         }
 
         xout[i] = val + b[i];
@@ -482,9 +489,13 @@ void matmul_bias(float* xout, QuantizedTensor *x, QuantizedTensor *w, float *b, 
 #endif
 
 void RoPERotation(float *sqk, float *f_real, float *f_imag, int num_heads, int head_size) {
-    for(int h=0; h<num_heads; h++) {
+    int h;
+    int i;
+
+    #pragma omp parallel for private(h, i)
+    for(h=0; h<num_heads; h++) {
         float* qk = sqk + h * head_size;
-        for(int i=0; i<head_size/2; i++) {
+        for(i=0; i<head_size/2; i++) {
             float qk0 = qk[i];
             float qk1 = qk[i + head_size/2];
             float fcr = f_real[i];
