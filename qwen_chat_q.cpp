@@ -27,7 +27,7 @@
     #include <sys/mman.h>
 #endif
 
-//#define NEON
+#define NEON
 
 #ifdef NEON
 #include <arm_neon.h>
@@ -381,9 +381,6 @@ inline void muladd(int32x4_t & sum, const int8x16_t & a, const int8x16_t & b)
 }
 
 void matmul(float* xout, QuantizedTensor *x, QuantizedTensor *w, int n, int d) {
-    int8x16_t column;
-    int8x16_t element;
-
     int i;
     #pragma omp parallel for private(i)
     for (i = 0; i < d; i++) {
@@ -392,9 +389,11 @@ void matmul(float* xout, QuantizedTensor *x, QuantizedTensor *w, int n, int d) {
         for(int j = 0; j <= n - GS; j += GS) {
             int32x4_t sum_gs = vdupq_n_s32(0);
             for(int k = 0; k < GS; k += 16) {
-                column = vld1q_s8(w->q + in + j + k);
-                element = vld1q_s8(x->q + j + k);
-                muladd(sum_gs, column, element);
+                int8x16_t column = vld1q_s8(w->q + in + j + k);
+                int8x16_t element = vld1q_s8(x->q + j + k);
+                int16x8_t lo = vmull_s8(vget_low_s8(column), vget_low_s8(element));
+                int16x8_t hi = vmull_s8(vget_high_s8(column), vget_high_s8(element));
+                sum_gs = vaddq_s32(sum_gs, vaddq_s32(vpaddlq_s16(lo), vpaddlq_s16(hi)));
             }
             int32x2_t sum2 = vpadd_s32(vget_high_s32(sum_gs), vget_low_s32(sum_gs));
             int rsum = vget_lane_s32(sum2, 0) + vget_lane_s32(sum2, 1);
@@ -406,9 +405,6 @@ void matmul(float* xout, QuantizedTensor *x, QuantizedTensor *w, int n, int d) {
 }
 
 void matmul_bias(float* xout, QuantizedTensor *x, QuantizedTensor *w, float *b, int n, int d) {
-    int8x16_t column;
-    int8x16_t element;
-
     int i;
     #pragma omp parallel for private(i)
     for (i = 0; i < d; i++) {
@@ -417,9 +413,11 @@ void matmul_bias(float* xout, QuantizedTensor *x, QuantizedTensor *w, float *b, 
         for(int j = 0; j <= n - GS; j += GS) {
             int32x4_t sum_gs = vdupq_n_s32(0);
             for(int k = 0; k < GS; k += 16) {
-                column = vld1q_s8(w->q + in + j + k);
-                element = vld1q_s8(x->q + j + k);
-                muladd(sum_gs, column, element);
+                int8x16_t column = vld1q_s8(w->q + in + j + k);
+                int8x16_t element = vld1q_s8(x->q + j + k);
+                int16x8_t lo = vmull_s8(vget_low_s8(column), vget_low_s8(element));
+                int16x8_t hi = vmull_s8(vget_high_s8(column), vget_high_s8(element));
+                sum_gs = vaddq_s32(sum_gs, vaddq_s32(vpaddlq_s16(lo), vpaddlq_s16(hi)));
             }
             int32x2_t sum2 = vpadd_s32(vget_high_s32(sum_gs), vget_low_s32(sum_gs));
             int rsum = vget_lane_s32(sum2, 0) + vget_lane_s32(sum2, 1);
@@ -490,12 +488,11 @@ void matmul_bias(float* xout, QuantizedTensor *x, QuantizedTensor *w, float *b, 
 
 void RoPERotation(float *sqk, float *f_real, float *f_imag, int num_heads, int head_size) {
     int h;
-    int i;
 
-    #pragma omp parallel for private(h, i)
+    #pragma omp parallel for private(h)
     for(h=0; h<num_heads; h++) {
         float* qk = sqk + h * head_size;
-        for(i=0; i<head_size/2; i++) {
+        for(int i=0; i<head_size/2; i++) {
             float qk0 = qk[i];
             float qk1 = qk[i + head_size/2];
             float fcr = f_real[i];
